@@ -365,6 +365,161 @@ pub(crate) fn note_damage(s: &mut Session, before: &Document, ids: &[LayerId]) {
     st.last_damage = layers_damage(before, &st.doc, ids);
 }
 
+/// Order-sensitive pixel identity of a layer: everything the compositor reads — blending,
+/// placement, masks, effects and pixels (identified by their copy-on-write tile pointers; both
+/// documents are alive while compared, so tile addresses cannot be reused under the
+/// comparison). UI-only fields (name, locks, label, `psd_blocks`, link groups, disclosure
+/// state) are deliberately left out. Keep in sync with `Layer`'s pixel-relevant fields.
+fn layer_fp(l: &Layer) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    fn surf(s: &photocraft_raster::Surface, h: &mut DefaultHasher) {
+        s.format().hash(h);
+        // Missing tiles read the default pixel, so tile identity alone is not pixel identity.
+        for v in s.default_pixel() {
+            v.to_bits().hash(h);
+        }
+        let tiles = s.tiles().fold(s.tile_count() as u64, |acc, (c, t)| {
+            let mut x = (std::sync::Arc::as_ptr(t) as usize as u64) ^ ((c.tx as u64) << 40) ^ ((c.ty as u32 as u64) << 8);
+            x = x.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            acc.wrapping_add(x ^ (x >> 29))
+        });
+        tiles.hash(h);
+    }
+    fn mask_fp(m: &photocraft_doc::LayerMask, h: &mut DefaultHasher) {
+        (m.enabled, m.linked, m.density.to_bits(), m.feather.to_bits()).hash(h);
+        surf(&m.surface, h);
+    }
+    fn blob(b: &std::sync::Arc<Vec<u8>>, h: &mut DefaultHasher) {
+        (std::sync::Arc::as_ptr(b) as usize, b.len()).hash(h);
+    }
+    fn text_fp(t: &photocraft_doc::TextLayer, h: &mut DefaultHasher) {
+        (
+            format!(
+                "{:?}",
+                (&t.text, &t.font_family, t.size_pt.to_bits(), &t.color, &t.transform, &t.runs, &t.paragraphs, &t.shape, &t.orientation, &t.antialias, &t.warp)
+            ),
+            t.cache.is_some(),
+        )
+            .hash(h);
+        if let Some(c) = &t.cache {
+            surf(c, h);
+        }
+        if let Some(b) = &t.psd_raw {
+            blob(b, h);
+        }
+    }
+    fn smart_fp(sm: &photocraft_doc::SmartObject, h: &mut DefaultHasher) {
+        (
+            sm.filters_enabled,
+            format!("{:?}", &sm.transform),
+            format!("{:?}", &sm.smart_filters),
+            format!("{:?}", &sm.stack_mode),
+            sm.perspective.map(|m| m.map(f64::to_bits)),
+        )
+            .hash(h);
+        match &sm.source {
+            photocraft_doc::SmartSource::Embedded { file_name, bytes } => {
+                file_name.hash(h);
+                blob(bytes, h);
+            }
+            photocraft_doc::SmartSource::Linked { path } => path.hash(h),
+        }
+        if let Some(c) = &sm.cache {
+            surf(c, h);
+        }
+        if let Some(b) = &sm.psd_raw {
+            blob(b, h);
+        }
+        if let Some(m) = &sm.filter_mask {
+            mask_fp(m, h);
+        }
+        if let Some(w) = &sm.warp {
+            format!("{w:?}").hash(h);
+        }
+    }
+    fn effects_fp(e: &photocraft_doc::Effects, h: &mut DefaultHasher) {
+        (e.enabled, format!("{:?}", &e.items), e.reference.map(|(x, y)| (x.to_bits(), y.to_bits()))).hash(h);
+        if let Some(b) = &e.psd_raw {
+            blob(b, h);
+        }
+    }
+    let mut h = DefaultHasher::new();
+    l.id.0.hash(&mut h);
+    l.visible.hash(&mut h);
+    l.blend.hash(&mut h);
+    l.opacity.to_bits().hash(&mut h);
+    l.fill_opacity.to_bits().hash(&mut h);
+    l.clipped.hash(&mut h);
+    l.excluded_channels.hash(&mut h);
+    format!("{:?}", &l.blend_if).hash(&mut h);
+    effects_fp(&l.effects, &mut h);
+    match &l.content {
+        LayerContent::Raster(s) => surf(s, &mut h),
+        LayerContent::Group(g) => {
+            format!("{:?}", &g.artboard).hash(&mut h);
+            for c in &g.children {
+                layer_fp(c).hash(&mut h);
+            }
+        }
+        LayerContent::Fill(_) | LayerContent::Adjustment(_) => format!("{:?}", &l.content).hash(&mut h),
+        LayerContent::Text(t) => text_fp(t, &mut h),
+        LayerContent::Shape(sh) => format!("{sh:?}").hash(&mut h),
+        LayerContent::Smart(sm) => smart_fp(sm, &mut h),
+    }
+    if let Some(fc) = &l.fill_cache {
+        surf(&fc.surface, &mut h);
+    }
+    if let Some(m) = &l.mask {
+        mask_fp(m, &mut h);
+    }
+    if let Some(vm) = &l.vector_mask {
+        (vm.enabled, vm.linked, vm.density.to_bits(), vm.feather.to_bits(), format!("{:?}", &vm.path)).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Pixels a single history step can have changed between `a` and `b` (the documents on either
+/// side of an undo or redo): the union of the change bounds of every layer whose pixel identity
+/// differs, so undoing a local edit recomposites only that area instead of the whole canvas.
+/// `None` (composite everything, as before) when the step touched the canvas itself (size,
+/// pixel format, colour profile), the layer structure (order, additions, removals, kind
+/// changes), or holds anything the fingerprint cannot bound (video layers).
+pub fn step_damage(a: &Document, b: &Document) -> Option<Rect> {
+    if a.size != b.size || a.pixel_format() != b.pixel_format() || a.icc_profile != b.icc_profile {
+        return None;
+    }
+    fn walk(xs: &[Layer], ys: &[Layer], a: &Document, b: &Document, out: &mut Rect) -> bool {
+        if xs.len() != ys.len() {
+            return false;
+        }
+        for (x, y) in xs.iter().zip(ys) {
+            if x.id != y.id || x.video.is_some() || y.video.is_some() {
+                return false;
+            }
+            if layer_fp(x) != layer_fp(y) {
+                // Both sides' extents: a move changes pixels where it left and where it landed.
+                let (Some(bx), Some(by)) = (photocraft_compose::change_bounds(x, a.bounds()), photocraft_compose::change_bounds(y, b.bounds())) else {
+                    return false;
+                };
+                *out = if out.is_empty() { bx.union(&by) } else { out.union(&bx).union(&by) };
+            }
+            match (x.children(), y.children()) {
+                (Some(xc), Some(yc)) => {
+                    if !walk(xc, yc, a, b, out) {
+                        return false;
+                    }
+                }
+                (None, None) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+    let mut out = Rect::EMPTY;
+    if walk(&a.layers, &b.layers, a, b, &mut out) { Some(out) } else { None }
+}
+
 /// Content bounds used by Align/Distribute: the layer's pixels (type and shape layers use their
 /// rendered pixels), or the union of a group's children. Fill and adjustment layers have none.
 pub fn layer_bounds(l: &Layer) -> Option<Rect> {
@@ -1332,6 +1487,46 @@ mod tests {
         for id in [c, d] {
             assert_eq!(doc(&s).layer(id).unwrap().link_group, Some(u64::MAX), "the existing group is untouched");
         }
+    }
+
+    #[test]
+    fn undo_and_redo_report_only_the_edited_area() {
+        let mut s = session(8);
+        let a = rect_layer(&mut s, Rect::new(10, 10, 20, 20));
+        select_all(&mut s, &[a]);
+        // A pixel edit on one layer is bounded by that layer's extent on both sides.
+        s.edit("paint", |doc, _| {
+            doc.layer_mut(a).unwrap().surface_mut().unwrap().fill_rect(Rect::new(12, 12, 14, 14), &[0.0, 0.0, 1.0, 1.0]);
+            Ok(())
+        })
+        .unwrap();
+        s.undo();
+        assert_eq!(damage(&s), Some(Rect::new(10, 10, 20, 20)));
+        s.redo();
+        assert_eq!(damage(&s), Some(Rect::new(10, 10, 20, 20)));
+        // A move reports where the layer was and where it landed.
+        s.execute("layer.translate", json!({"dx": 5, "dy": 0})).unwrap();
+        s.undo();
+        assert_eq!(damage(&s), Some(Rect::new(10, 10, 25, 20)), "union of where the layer was and is");
+        s.redo();
+        assert_eq!(damage(&s), Some(Rect::new(10, 10, 25, 20)));
+    }
+
+    #[test]
+    fn undo_of_document_wide_steps_still_composites_everything() {
+        let mut s = session(8);
+        let _ = rect_layer(&mut s, Rect::new(10, 10, 20, 20));
+        // A canvas change has no bounded damage.
+        s.execute("image.crop", json!({"x": 0, "y": 0, "width": 30, "height": 25})).unwrap();
+        assert_ne!(doc(&s).size, photocraft_doc::Size::new(100, 80));
+        s.undo();
+        assert_eq!(damage(&s), None, "a size change recomposites the whole canvas");
+        // A structural change (a layer removed and restored) neither.
+        let b = rect_layer(&mut s, Rect::new(0, 0, 5, 5));
+        select_all(&mut s, &[b]);
+        s.execute("layer.delete", json!({})).unwrap();
+        s.undo();
+        assert_eq!(damage(&s), None);
     }
 
     #[test]
