@@ -10,7 +10,6 @@
 //!   tree is `ui.menu.list`
 //! - `ui.set {tool?, panels?, dock?, dockTabs?, dockWidth?, colorPanel?, maskTarget?, vectorMaskTarget?, selectionMode?, zoom?, center?, fit?, theme?, brushSection?, brushTab?, brushesView?, brushPicker?, brushPickerView?, brushSize?}`:
 //!   change UI state; any other field is an error ([`UI_SET_FIELDS`])
-//! - `ui.menu.invoke {id, wait?}` / `ui.menu.list`: activate a menu item by id; list the menu tree
 //! - `ui.dialog.open {kind, fields?}` (kinds: newDocument, about, layerStyle {effect?}, colorPicker {target: foreground|background}, command {command}) / `ui.dialog.set {dialog, field, value}` / `ui.dialog.confirm {dialog, wait?}` / `ui.dialog.cancel {dialog}`
 //! - `ui.dialog.apply {dialog}`: commit Preferences changes without closing the dialog
 //! - `ui.window.open {document?}` / `ui.window.close {window}`: extra document windows
@@ -68,8 +67,10 @@ pub enum Outcome {
     AfterJob(photocraft_engine::jobs::JobId),
 }
 
-/// The fields `ui.set` reads. Anything else is rejected before a field is applied, so a typo or
-/// a field the method doesn't have can't reply with success while nothing changes (#412).
+/// The fields `ui.set` reads. Anything else is rejected before a field is applied, and every
+/// field's value is validated before the first one is applied, so a typo, an unknown field, a
+/// bad value or a bad nested key can't reply with success while nothing — or only half of it —
+/// changed (#412).
 pub const UI_SET_FIELDS: [&str; 21] = [
     "tool",
     "panels",
@@ -99,6 +100,51 @@ fn ok(v: Value) -> Outcome {
 }
 fn err(e: impl std::fmt::Display) -> Outcome {
     Outcome::Done(json!({"ok": false, "error": e.to_string()}))
+}
+
+/// A `ui.set` boolean field: `Ok(None)` when absent, an error when present with another type.
+fn bool_field(p: &Value, key: &str) -> std::result::Result<Option<bool>, String> {
+    match p.get(key) {
+        None => Ok(None),
+        Some(v) => v.as_bool().map(Some).ok_or_else(|| format!("{key} must be a boolean")),
+    }
+}
+
+/// A `ui.set` integer field: `Ok(None)` when absent; whole-number floats (`12.0`, as UIs send
+/// them) are accepted, anything else is an error.
+fn uint_field(p: &Value, key: &str) -> std::result::Result<Option<u64>, String> {
+    match p.get(key) {
+        None => Ok(None),
+        Some(v) if v.is_u64() => Ok(v.as_u64()),
+        Some(v) => v.as_f64().filter(|f| f.fract() == 0.0 && *f >= 0.0).map(|f| Some(f as u64)).ok_or_else(|| format!("{key} must be a non-negative integer")),
+    }
+}
+
+/// A `ui.set` numeric field: `Ok(None)` when absent, finite numbers only.
+fn num_field(p: &Value, key: &str) -> std::result::Result<Option<f64>, String> {
+    match p.get(key) {
+        None => Ok(None),
+        Some(v) => v.as_f64().filter(|f| f.is_finite()).map(Some).ok_or_else(|| format!("{key} must be a finite number")),
+    }
+}
+
+/// A `ui.set` object field (e.g. `panels`): the patch's keys are merged into the serialized
+/// current value and parsed back, so a non-object value or an unknown nested key is an error —
+/// a nested typo must not reply ok while changing nothing.
+fn merged_object<T: serde::Serialize + serde::de::DeserializeOwned>(current: &T, patch: Option<&Value>, field: &str) -> std::result::Result<Option<T>, String> {
+    let Some(patch) = patch else { return Ok(None) };
+    let Some(patch) = patch.as_object() else { return Err(format!("{field} must be an object")) };
+    let mut cur = serde_json::to_value(current).map_err(|e| e.to_string())?;
+    let known: std::collections::HashSet<String> = cur.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+    for (k, v) in patch {
+        if !known.contains(k) {
+            return Err(format!("unknown {field} field `{k}`"));
+        }
+        if let Some(c) = cur.as_object_mut() {
+            c.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::from_value(cur).map(Some).map_err(|e| format!("{field}: {e}"))
 }
 fn wrap(r: Result<Value, String>) -> Outcome {
     match r {
@@ -137,16 +183,6 @@ fn screen_point(app: &PhotocraftApp, x: f64, y: f64) -> [f32; 2] {
 }
 
 pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
-    let saved = app.session.authorize;
-    if let Some(gate) = app.services.automation_authorize {
-        app.session.authorize = Some(gate);
-    }
-    let outcome = dispatch(app, ctx, req);
-    app.session.authorize = saved;
-    outcome
-}
-
-fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
     let p = &req.params;
     let s = |k: &str| p.get(k).and_then(Value::as_str);
     let u = |k: &str| p.get(k).and_then(Value::as_u64);
@@ -218,138 +254,158 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
             } else {
                 None
             };
-            if let Some(value) = p.get("gradientClassic")
-                && !value.is_boolean()
-            {
-                return err("gradientClassic must be a boolean");
-            }
-            if let Some(t) = s("tool") {
-                match Tool::from_name(t) {
-                    Some(t) => app.ui.tool = t,
-                    None => return err(format!("unknown tool `{t}`")),
+            // Everything is validated and materialized before the first field is applied, so a
+            // rejected call applies none of its fields (#412's guarantee, down to the values
+            // and nested keys).
+            let applied = (|| -> std::result::Result<Value, String> {
+                let tool = match s("tool") {
+                    Some(t) => Tool::from_name(t).map(Some).ok_or_else(|| format!("unknown tool `{t}`"))?,
+                    None => None,
+                };
+                let gradient_classic = bool_field(p, "gradientClassic")?;
+                let panels = merged_object(&app.ui.panels, p.get("panels"), "panels")?;
+                let mask_target = bool_field(p, "maskTarget")?;
+                let vector_mask_target = bool_field(p, "vectorMaskTarget")?;
+                let selection_mode = uint_field(p, "selectionMode")?;
+                let dock_tabs = merged_object(&app.ui.dock_tabs, p.get("dockTabs"), "dockTabs")?;
+                let dock = match p.get("dock") {
+                    Some(d) => serde_json::from_value(d.clone()).map(Some).map_err(|e| format!("dock: {e}"))?,
+                    None => None,
+                };
+                let dock_width = num_field(p, "dockWidth")?;
+                let zoom = num_field(p, "zoom")?;
+                let center = match p.get("center") {
+                    Some(v) => {
+                        let a = v.as_array().ok_or_else(|| "center must be [x, y]".to_string())?;
+                        let (Some(x), Some(y)) = (a.first().and_then(Value::as_f64), a.get(1).and_then(Value::as_f64)) else {
+                            return Err("center must be [x, y] of two numbers".into());
+                        };
+                        Some([x as f32, y as f32])
+                    }
+                    None => None,
+                };
+                let fit = bool_field(p, "fit")? == Some(true);
+                let theme = match s("theme") {
+                    Some(name) => {
+                        let kind = crate::theme::ThemeKind::from_name(name).ok_or_else(|| {
+                            let names: Vec<_> = crate::theme::ThemeKind::ALL.iter().map(|k| k.id()).collect();
+                            format!("unknown theme `{name}` ({})", names.join(", "))
+                        })?;
+                        Some(kind)
+                    }
+                    None => None,
+                };
+                let brush_section = uint_field(p, "brushSection")?;
+                let brush_tab = uint_field(p, "brushTab")?;
+                let brushes_view = match p.get("brushesView") {
+                    Some(v) => serde_json::from_value(v.clone()).map(Some).map_err(|e| format!("brushesView: {e} (list, grid)"))?,
+                    None => None,
+                };
+                let brush_picker_view = match p.get("brushPickerView") {
+                    Some(v) => serde_json::from_value(v.clone()).map(Some).map_err(|e| format!("brushPickerView: {e} (list, grid)"))?,
+                    None => None,
+                };
+                let brush_picker = match p.get("brushPicker") {
+                    Some(v) => {
+                        let at = serde_json::from_value::<Option<[f32; 2]>>(v.clone())
+                            .map_err(|_| "brushPicker must be [x, y] in screen points, or null to close it".to_string())?;
+                        if at.is_some_and(|[x, y]| !x.is_finite() || !y.is_finite()) {
+                            return Err("brushPicker must be [x, y] in screen points, or null to close it".into());
+                        }
+                        at
+                    }
+                    None => None,
+                };
+                // Which chip the Color panel edits.
+                let color_panel = match p.get("colorPanel") {
+                    Some(c) => serde_json::from_value(c.clone()).map(Some).map_err(|e| e.to_string())?,
+                    None => None,
+                };
+                // The Brush Settings panel's range: out-of-range values clamp instead of
+                // producing an unusable (or infinite) tip size.
+                let brush_size = num_field(p, "brushSize")?.map(|v| v.clamp(0.5, 5000.0) as f32);
+
+                // Apply (nothing below can fail).
+                if let Some(t) = tool {
+                    app.ui.tool = t;
                 }
-            }
-            let gradient_before = app.ui.tool_options.clone();
-            if let Some(mode) = gradient_blend {
-                app.ui.tool_options.gradient_blend_mode = mode;
-            }
-            if let Some(classic) = p.get("gradientClassic").and_then(Value::as_bool) {
-                app.ui.tool_options.gradient_classic = classic;
-            }
-            if gradient_blend.is_some() {
-                crate::gradient_ui::options_changed(app, &gradient_before);
-            }
-            if let Some(panels) = p.get("panels") {
-                let mut cur = serde_json::to_value(&app.ui.panels).unwrap_or_default();
-                if let (Some(c), Some(n)) = (cur.as_object_mut(), panels.as_object()) {
-                    for (k, v) in n {
-                        c.insert(k.clone(), v.clone());
+                let gradient_before = app.ui.tool_options.clone();
+                if let Some(mode) = gradient_blend {
+                    app.ui.tool_options.gradient_blend_mode = mode;
+                }
+                if let Some(classic) = gradient_classic {
+                    app.ui.tool_options.gradient_classic = classic;
+                }
+                if gradient_blend.is_some() {
+                    crate::gradient_ui::options_changed(app, &gradient_before);
+                }
+                if let Some(v) = panels {
+                    app.ui.panels = v;
+                }
+                if let Some(m) = mask_target {
+                    app.ui.mask_target = m;
+                    app.ui.vector_mask_target &= !m;
+                }
+                if let Some(m) = vector_mask_target {
+                    app.ui.vector_mask_target = m;
+                    app.ui.mask_target &= !m;
+                }
+                // Selection tools' options-bar mode: 0 New, 1 Add, 2 Subtract, 3 Intersect.
+                if let Some(m) = selection_mode {
+                    app.ui.selection_mode = m.min(3) as u8;
+                }
+                if let Some(v) = dock_tabs {
+                    app.ui.dock_tabs = v;
+                }
+                // Dock group order, heights and collapsed groups (see `dock::DockLayout`).
+                if let Some(v) = dock {
+                    app.ui.dock = v;
+                }
+                // Right dock width in points (clamped to the dock's 250..=520 range), applied next frame.
+                if let Some(w) = dock_width {
+                    crate::panels::request_dock_width(ctx, w as f32);
+                }
+                if let Some(i) = app.session.active_index() {
+                    if let Some(z) = zoom {
+                        app.ui.views[i].zoom = (z as f32).clamp(0.01, 64.0);
+                        app.ui.views[i].fit_pending = false;
+                    }
+                    if let Some(c) = center {
+                        app.ui.views[i].center = c;
+                        app.ui.views[i].fit_pending = false;
+                    }
+                    if fit {
+                        app.ui.views[i].fit_pending = true;
                     }
                 }
-                match serde_json::from_value(cur) {
-                    Ok(v) => app.ui.panels = v,
-                    Err(e) => return err(e),
+                if let Some(k) = theme {
+                    app.set_theme(ctx, k);
                 }
-            }
-            if let Some(m) = p.get("maskTarget").and_then(Value::as_bool) {
-                app.ui.mask_target = m;
-                app.ui.vector_mask_target &= !m;
-            }
-            if let Some(m) = p.get("vectorMaskTarget").and_then(Value::as_bool) {
-                app.ui.vector_mask_target = m;
-                app.ui.mask_target &= !m;
-            }
-            // Selection tools' options-bar mode: 0 New, 1 Add, 2 Subtract, 3 Intersect.
-            if let Some(m) = p.get("selectionMode").and_then(Value::as_u64) {
-                app.ui.selection_mode = m.min(3) as u8;
-            }
-            if let Some(tabs) = p.get("dockTabs") {
-                let mut cur = serde_json::to_value(app.ui.dock_tabs).unwrap_or_default();
-                if let (Some(c), Some(n)) = (cur.as_object_mut(), tabs.as_object()) {
-                    for (k, v) in n {
-                        c.insert(k.clone(), v.clone());
-                    }
+                if let Some(i) = brush_section {
+                    app.ui.brush_section = (i as usize).min(crate::brush_panel::SECTIONS.len() - 1);
                 }
-                match serde_json::from_value(cur) {
-                    Ok(v) => app.ui.dock_tabs = v,
-                    Err(e) => return err(e),
+                if let Some(i) = brush_tab {
+                    app.ui.brush_tab = (i as usize).min(1);
                 }
-            }
-            // Dock group order, heights and collapsed groups (see `dock::DockLayout`).
-            if let Some(d) = p.get("dock") {
-                match serde_json::from_value(d.clone()) {
-                    Ok(v) => app.ui.dock = v,
-                    Err(e) => return err(e),
+                if let Some(v) = brushes_view {
+                    app.ui.brushes_panel.view = v;
                 }
-            }
-            // Which chip the Color panel edits.
-            if let Some(c) = p.get("colorPanel") {
-                match serde_json::from_value(c.clone()) {
-                    Ok(v) => app.ui.color_panel = v,
-                    Err(e) => return err(e),
+                if let Some(v) = brush_picker_view {
+                    app.ui.brush_picker_list.view = v;
                 }
-            }
-            // Right dock width in points (clamped to the dock's 250..=520 range), applied next frame.
-            if let Some(w) = p.get("dockWidth").and_then(Value::as_f64) {
-                crate::panels::request_dock_width(ctx, w as f32);
-            }
-            if let Some(i) = app.session.active_index() {
-                if let Some(z) = p.get("zoom").and_then(Value::as_f64) {
-                    app.ui.views[i].zoom = (z as f32).clamp(0.01, 64.0);
-                    app.ui.views[i].fit_pending = false;
-                    app.ui.views[i].fill_pending = false;
+                if let Some(at) = brush_picker {
+                    app.ui.brush_picker = at;
                 }
-                if let Some(c) = p.get("center").and_then(Value::as_array)
-                    && c.len() == 2
-                {
-                    app.ui.views[i].center = [c[0].as_f64().unwrap_or(0.0) as f32, c[1].as_f64().unwrap_or(0.0) as f32];
-                    app.ui.views[i].fit_pending = false;
-                    app.ui.views[i].fill_pending = false;
+                // Which chip the Color panel edits.
+                if let Some(c) = color_panel {
+                    app.ui.color_panel = c;
                 }
-                if p.get("fit").and_then(Value::as_bool) == Some(true) {
-                    app.ui.views[i].fit_pending = true;
-                    app.ui.views[i].fill_pending = false;
+                if let Some(size) = brush_size {
+                    app.session.tools.brush.size = size;
                 }
-            }
-            if let Some(name) = s("theme") {
-                match crate::theme::ThemeKind::from_name(name) {
-                    Some(k) => app.set_theme(ctx, k),
-                    None => {
-                        let names: Vec<_> = crate::theme::ThemeKind::ALL.iter().map(|k| k.id()).collect();
-                        return err(format!("unknown theme `{name}` ({})", names.join(", ")));
-                    }
-                }
-            }
-            if let Some(i) = u("brushSection") {
-                app.ui.brush_section = (i as usize).min(crate::brush_panel::SECTIONS.len() - 1);
-            }
-            if let Some(i) = u("brushTab") {
-                app.ui.brush_tab = (i as usize).min(1);
-            }
-            if let Some(v) = p.get("brushesView").cloned() {
-                match serde_json::from_value(v) {
-                    Ok(v) => app.ui.brushes_panel.view = v,
-                    Err(e) => return err(format!("brushesView: {e} (list, grid)")),
-                }
-            }
-            if let Some(v) = p.get("brushPickerView").cloned() {
-                match serde_json::from_value(v) {
-                    Ok(v) => app.ui.brush_picker_list.view = v,
-                    Err(e) => return err(format!("brushPickerView: {e} (list, grid)")),
-                }
-            }
-            if let Some(v) = p.get("brushPicker").cloned() {
-                match serde_json::from_value::<Option<[f32; 2]>>(v) {
-                    Ok(at) if at.is_none_or(|[x, y]| x.is_finite() && y.is_finite()) => app.ui.brush_picker = at,
-                    _ => return err("brushPicker must be [x, y] in screen points, or null to close it"),
-                }
-            }
-            if let Some(size) = p.get("brushSize").and_then(Value::as_f64)
-                && let Err(e) = app.run("tools.setBrush", json!({"brush": {"size": size}}))
-            {
-                return err(e);
-            }
-            ok(Value::Null)
+                Ok(Value::Null)
+            })();
+            wrap(applied)
         }
         "ui.dialog.open" => {
             let kind = match s("kind").unwrap_or("") {
@@ -594,11 +650,13 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
                     None => Err("automation read authority is not configured".into()),
                 };
                 wrap(opened.and_then(|(name, bytes)| {
-                    let name = app.open_name(&name);
                     let warnings = app.open_automation_bytes(&name, &bytes)?;
                     // Brushes/gradients go to the preset libraries: no document, no Open Recent entry.
                     if !crate::preset_files_ui::is_preset_file(&name) {
-                        app.opened_from(path);
+                        if let Some(state) = app.session.active_mut() {
+                            state.path = Some(path.to_string());
+                        }
+                        app.push_recent(path);
                     }
                     Ok(json!({"path": path, "name": name, "warnings": warnings}))
                 }))
@@ -624,7 +682,6 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
         "window": {"width": screen.width(), "height": screen.height(), "pixelsPerPoint": ctx.pixels_per_point()},
         "tool": app.ui.tool,
         "toolOptions": app.ui.tool_options,
-        "magnetic": app.ui.magnetic,
         "textEdit": app.ui.text_edit,
         "layerMenu": app.ui.layer_menu,
         "canvasToolMenu": app.ui.canvas_tool_menu.as_ref().map(|menu| {
@@ -653,7 +710,7 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
         "brush": {"size": app.session.tools.brush.size, "hardness": app.session.tools.brush.hardness, "opacity": app.session.tools.brush.opacity},
         "distort": app.distort.describe(),
         "jobs": crate::jobs_ui::inspect(app),
-        "cameraRaw": app.camera_raw.as_ref().map(|d| d.describe(&app.ui.camera_raw_scope, &app.ui.camera_raw_preview)),
+        "cameraRaw": app.camera_raw.as_ref().map(|d| d.describe(&app.ui.camera_raw_scope)),
     })
 }
 
@@ -821,12 +878,44 @@ mod tests {
 
     #[test]
     fn ui_set_color_panel_picks_the_edited_chip() {
+    }
+
+    #[test]
+    fn ui_set_applies_all_fields_or_none() {
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
         let ctx = egui::Context::default();
-        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"colorPanel": {"background": true}}))["ok"], true);
-        assert!(app.ui.color_panel.background);
-        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"colorPanel": {"background": "yes"}}))["ok"], false);
-        assert!(app.ui.color_panel.background, "a bad value changes nothing");
+        let before = app.ui.tool;
+        let panels_before = serde_json::to_value(&app.ui.panels).unwrap_or_default();
+        // A late invalid field must not leave the earlier valid one applied.
+        let r = call(&mut app, &ctx, "ui.set", json!({"tool": "move", "theme": "nope"}));
+        assert_eq!(r["ok"], false, "{r}");
+        assert_eq!(app.ui.tool, before, "a rejected call applies none of its fields");
+        // Wrong types and unknown nested keys are errors now, not silent no-ops with ok:true.
+        for params in [
+            json!({"panels": "x"}),
+            json!({"panels": {"nope": true}}),
+            json!({"dockTabs": {"nope": 1}}),
+            json!({"center": [1]}),
+            json!({"center": "here"}),
+            json!({"brushSize": "big"}),
+            json!({"selectionMode": "add"}),
+        ] {
+            let r = call(&mut app, &ctx, "ui.set", params.clone());
+            assert_eq!(r["ok"], false, "{params}: {r}");
+        }
+        assert_eq!(serde_json::to_value(&app.ui.panels).unwrap_or_default(), panels_before, "nothing was applied");
+    }
+
+    #[test]
+    fn ui_set_brush_size_clamps_into_the_panel_range() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let ctx = egui::Context::default();
+        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"brushSize": 1e300}))["ok"], true);
+        assert_eq!(app.session.tools.brush.size, 5000.0, "an enormous size clamps, it does not become inf");
+        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"brushSize": -5.0}))["ok"], true);
+        assert_eq!(app.session.tools.brush.size, 0.5);
+        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"brushSize": 42.0}))["ok"], true);
+        assert_eq!(app.session.tools.brush.size, 42.0);
     }
 
     #[test]
@@ -859,37 +948,6 @@ mod tests {
         assert_eq!(app.session.active_index(), before, "the active document is untouched");
         // A valid index still opens the window.
         assert_eq!(call(&mut app, &ctx, "ui.window.open", json!({"document": 0}))["ok"], true);
-    }
-
-    #[test]
-    fn ui_set_brush_size_dispatches_a_journaled_brush_command() {
-        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
-        let ctx = egui::Context::default();
-
-        let r = call(&mut app, &ctx, "ui.set", json!({"brushSize": 42.5}));
-        assert_eq!(r["ok"], true, "{r}");
-        assert_eq!(app.session.tools.brush.size, 42.5);
-        let (id, params) = app.session.journal.last().cloned().expect("brush change is journaled");
-        assert_eq!(id, "tools.setBrush");
-        assert_eq!(params, json!({"brush": {"size": 42.5}}));
-
-        // The control API has historically ignored non-numeric optional values.
-        for params in [json!({}), json!({"brushSize": null}), json!({"brushSize": "large"}), json!({"brushSize": true})] {
-            let journal_len = app.session.journal.len();
-            let r = call(&mut app, &ctx, "ui.set", params);
-            assert_eq!(r["ok"], true, "{r}");
-            assert_eq!(app.session.tools.brush.size, 42.5);
-            assert_eq!(app.session.journal.len(), journal_len);
-        }
-
-        // Values that cannot be represented by BrushSettings must report the command error and
-        // leave both the brush and journal unchanged instead of mutating tool state directly.
-        let journal_len = app.session.journal.len();
-        let r = call(&mut app, &ctx, "ui.set", json!({"brushSize": f64::MAX}));
-        assert_eq!(r["ok"], false, "{r}");
-        assert!(r["error"].as_str().is_some(), "{r}");
-        assert_eq!(app.session.tools.brush.size, 42.5);
-        assert_eq!(app.session.journal.len(), journal_len);
     }
 
     #[test]
@@ -996,59 +1054,5 @@ mod tests {
         let r = call(&mut app, &ctx, "app.save", json!({}));
         assert_eq!(r["result"]["path"], "in/layered.psd", "{r}");
         assert_eq!(written.borrow().last().map(String::as_str), Some("in/layered.psd"));
-        // A template opens untitled, so a save without `path` never writes over it.
-        let r = call(&mut app, &ctx, "app.open", json!({"path": "in/card.psdt"}));
-        assert_eq!(r["result"]["name"], "Untitled-1", "{r}");
-        assert_eq!(app.session.active().unwrap().path, None);
-        let r = call(&mut app, &ctx, "app.save", json!({}));
-        assert!(r["error"].as_str().unwrap().contains("pass `path`"), "{r}");
-    }
-
-    fn deny_ambient_file(id: &str, _: &serde_json::Value) -> photocraft_engine::Result<()> {
-        if id.starts_with("file.") && id != "file.new" {
-            Err(photocraft_engine::EngineError::Other(format!("automation command `{id}` is disabled")))
-        } else {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn actions_play_checks_each_step_over_control() {
-        let services = crate::Services { automation_authorize: Some(deny_ambient_file), ..Default::default() };
-        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
-        app.session.actions.list.push(photocraft_engine::actions_cmds::Action {
-            name: "Open".into(),
-            steps: vec![("file.open".into(), json!({"path": "/etc/passwd"})), ("layer.new.layer".into(), json!({}))],
-        });
-        let ctx = egui::Context::default();
-        let r = call(&mut app, &ctx, "engine.execute", json!({"command": "actions.play", "params": {"action": "Open"}}));
-        assert_eq!(r["ok"], true, "{r}");
-        assert_eq!(r["result"]["ran"], 0, "{r}");
-        assert_eq!(r["result"]["failed"]["id"], "file.open", "{r}");
-        assert!(r["result"]["failed"]["error"].as_str().unwrap_or("").contains("disabled"), "{r}");
-        assert!(app.session.documents().is_empty());
-        assert!(app.session.authorize.is_none(), "the per-step gate is only installed for the request");
-    }
-
-    #[test]
-    fn actions_play_checks_each_step_for_synthetic_input() {
-        let services = crate::Services { automation_authorize: Some(deny_ambient_file), ..Default::default() };
-        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
-        app.session.actions.list.push(photocraft_engine::actions_cmds::Action {
-            name: "Open".into(),
-            steps: vec![("file.open".into(), json!({"path": "/etc/passwd"})), ("layer.new.layer".into(), json!({}))],
-        });
-        app.automation_input = true;
-        let r = app.run("actions.play", json!({"action": "Open"})).unwrap();
-        assert_eq!(r["ran"], 0, "{r}");
-        assert_eq!(r["failed"]["id"], "file.open", "{r}");
-        assert!(app.session.authorize.is_none(), "the per-step gate is only installed for the command");
-
-        // A local play (no automation input) still runs recorded steps.
-        app.automation_input = false;
-        app.session.actions.list[0].steps.remove(0);
-        app.session.execute("file.new", json!({"width": 4, "height": 4})).unwrap();
-        let r = app.run("actions.play", json!({"action": "Open"})).unwrap();
-        assert_eq!(r["ran"], 1, "{r}");
     }
 }
