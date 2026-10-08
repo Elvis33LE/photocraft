@@ -294,8 +294,9 @@ pub struct Services {
     pub native_menu: Option<native_menu::NativeMenu>,
 }
 
-/// A document histogram being computed off the UI thread: (document, revision, receiver).
-pub(crate) type HistJob = (DocId, u64, std::sync::mpsc::Receiver<(DocId, String, std::sync::Arc<tone::Histograms>)>);
+/// A document histogram being computed off the UI thread: (document, revision, receiver of
+/// (document, compute ms, histograms)).
+pub(crate) type HistJob = (DocId, u64, std::sync::mpsc::Receiver<(DocId, f64, std::sync::Arc<tone::Histograms>)>);
 
 pub struct PhotocraftApp {
     pub session: Session,
