@@ -365,128 +365,214 @@ pub(crate) fn note_damage(s: &mut Session, before: &Document, ids: &[LayerId]) {
     st.last_damage = layers_damage(before, &st.doc, ids);
 }
 
-/// Order-sensitive pixel identity of a layer: everything the compositor reads — blending,
-/// placement, masks, effects and pixels (identified by their copy-on-write tile pointers; both
-/// documents are alive while compared, so tile addresses cannot be reused under the
-/// comparison). UI-only fields (name, locks, label, `psd_blocks`, link groups, disclosure
-/// state) are deliberately left out. Keep in sync with `Layer`'s pixel-relevant fields.
-fn layer_fp(l: &Layer) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    fn surf(s: &photocraft_raster::Surface, h: &mut DefaultHasher) {
-        s.format().hash(h);
-        // Missing tiles read the default pixel, so tile identity alone is not pixel identity.
-        for v in s.default_pixel() {
-            v.to_bits().hash(h);
+/// Whether two surfaces hold identical pixels: same format and default pixel, and the same
+/// copy-on-write tile pointers at the same coordinates. Both documents stay alive during the
+/// comparison, so tile addresses cannot be reused under it.
+fn surfaces_equal(a: &photocraft_raster::Surface, b: &photocraft_raster::Surface) -> bool {
+    a.format() == b.format()
+        && a.default_pixel() == b.default_pixel()
+        && a.tile_count() == b.tile_count()
+        && a.tiles().zip(b.tiles()).all(|((ca, ta), (cb, tb))| ca == cb && std::sync::Arc::ptr_eq(ta, tb))
+}
+
+/// Byte blobs kept in `Arc`s (PSD raw blocks, embedded smart-object sources): pointer-identical
+/// or content-equal (they are small compared to pixels, and undo steps rarely re-parse them).
+fn blob_equal(x: &std::sync::Arc<Vec<u8>>, y: &std::sync::Arc<Vec<u8>>) -> bool {
+    std::sync::Arc::ptr_eq(x, y) || (x.len() == y.len() && x.as_slice() == y.as_slice())
+}
+
+fn blobs_equal(a: &Option<std::sync::Arc<Vec<u8>>>, b: &Option<std::sync::Arc<Vec<u8>>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => blob_equal(x, y),
+        _ => false,
+    }
+}
+
+/// Layer masks (also the smart-filter mask): scalars plus tile-pointer surface identity.
+fn masks_equal(a: &Option<photocraft_doc::LayerMask>, b: &Option<photocraft_doc::LayerMask>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.enabled == y.enabled && x.linked == y.linked && x.density == y.density && x.feather == y.feather && surfaces_equal(&x.surface, &y.surface)
         }
-        let tiles = s.tiles().fold(s.tile_count() as u64, |acc, (c, t)| {
-            let mut x = (std::sync::Arc::as_ptr(t) as usize as u64) ^ ((c.tx as u64) << 40) ^ ((c.ty as u32 as u64) << 8);
-            x = x.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            acc.wrapping_add(x ^ (x >> 29))
-        });
-        tiles.hash(h);
+        _ => false,
     }
-    fn mask_fp(m: &photocraft_doc::LayerMask, h: &mut DefaultHasher) {
-        (m.enabled, m.linked, m.density.to_bits(), m.feather.to_bits()).hash(h);
-        surf(&m.surface, h);
-    }
-    fn blob(b: &std::sync::Arc<Vec<u8>>, h: &mut DefaultHasher) {
-        (std::sync::Arc::as_ptr(b) as usize, b.len()).hash(h);
-    }
-    fn text_fp(t: &photocraft_doc::TextLayer, h: &mut DefaultHasher) {
-        (
-            format!(
-                "{:?}",
-                (&t.text, &t.font_family, t.size_pt.to_bits(), &t.color, &t.transform, &t.runs, &t.paragraphs, &t.shape, &t.orientation, &t.antialias, &t.warp)
-            ),
-            t.cache.is_some(),
-        )
-            .hash(h);
-        if let Some(c) = &t.cache {
-            surf(c, h);
+}
+
+fn texts_equal(a: &photocraft_doc::TextLayer, b: &photocraft_doc::TextLayer) -> bool {
+    a.text == b.text
+        && a.font_family == b.font_family
+        && a.size_pt == b.size_pt
+        && a.color == b.color
+        && a.transform == b.transform
+        && a.runs == b.runs
+        && a.paragraphs == b.paragraphs
+        && a.shape == b.shape
+        && a.orientation == b.orientation
+        && a.antialias == b.antialias
+        && a.warp == b.warp
+        && match (&a.cache, &b.cache) {
+            (None, None) => true,
+            (Some(x), Some(y)) => surfaces_equal(x, y),
+            _ => false,
         }
-        if let Some(b) = &t.psd_raw {
-            blob(b, h);
-        }
-    }
-    fn smart_fp(sm: &photocraft_doc::SmartObject, h: &mut DefaultHasher) {
-        (
-            sm.filters_enabled,
-            format!("{:?}", &sm.transform),
-            format!("{:?}", &sm.smart_filters),
-            format!("{:?}", &sm.stack_mode),
-            sm.perspective.map(|m| m.map(f64::to_bits)),
-        )
-            .hash(h);
-        match &sm.source {
-            photocraft_doc::SmartSource::Embedded { file_name, bytes } => {
-                file_name.hash(h);
-                blob(bytes, h);
+        && blobs_equal(&a.psd_raw, &b.psd_raw)
+}
+
+fn smarts_equal(a: &photocraft_doc::SmartObject, b: &photocraft_doc::SmartObject) -> bool {
+    a.filters_enabled == b.filters_enabled
+        && a.transform == b.transform
+        && a.smart_filters == b.smart_filters
+        && a.stack_mode == b.stack_mode
+        && a.perspective == b.perspective
+        && a.warp == b.warp
+        && match (&a.source, &b.source) {
+            (photocraft_doc::SmartSource::Embedded { file_name: x, bytes: xb }, photocraft_doc::SmartSource::Embedded { file_name: y, bytes: yb }) => {
+                x == y && blob_equal(xb, yb)
             }
-            photocraft_doc::SmartSource::Linked { path } => path.hash(h),
+            (photocraft_doc::SmartSource::Linked { path: x }, photocraft_doc::SmartSource::Linked { path: y }) => x == y,
+            _ => false,
         }
-        if let Some(c) = &sm.cache {
-            surf(c, h);
+        && match (&a.cache, &b.cache) {
+            (None, None) => true,
+            (Some(x), Some(y)) => surfaces_equal(x, y),
+            _ => false,
         }
-        if let Some(b) = &sm.psd_raw {
-            blob(b, h);
+        && blobs_equal(&a.psd_raw, &b.psd_raw)
+        && masks_equal(&a.filter_mask, &b.filter_mask)
+}
+
+/// Extra alpha/spot channels (the image itself in Multichannel mode).
+fn alpha_channels_equal(a: &photocraft_doc::AlphaChannel, b: &photocraft_doc::AlphaChannel) -> bool {
+    a.name == b.name && a.spot == b.spot && a.color == b.color && a.opacity == b.opacity && a.indicates == b.indicates && surfaces_equal(&a.surface, &b.surface)
+}
+
+/// Whether two layers render to identical pixels in place. Everything the compositor reads is
+/// compared structurally — no hashing, a hash collision would under-report damage; pixels are
+/// identified by their copy-on-write tile pointers. Group children are deliberately *not*
+/// compared here: the caller walks into them, so an edit inside a group damages only the
+/// edited child's extent, not the whole group's. The destructure is exhaustive, so a new
+/// `Layer` field fails to compile until it is classified: compared, or explicitly ignored
+/// (name, locks, label, `psd_blocks`, `psd_id`, link group — none of them composite; video
+/// bails out earlier in the walk).
+fn layer_pixels_equal(a: &Layer, b: &Layer) -> bool {
+    let Layer {
+        id,
+        name: _,
+        visible,
+        locks: _,
+        blend,
+        opacity,
+        fill_opacity,
+        clipped,
+        mask,
+        vector_mask,
+        effects,
+        label: _,
+        content,
+        psd_blocks: _,
+        psd_id: _,
+        fill_cache,
+        link_group: _,
+        excluded_channels,
+        blend_if,
+        video: _,
+    } = a;
+    *id == b.id
+        && *visible == b.visible
+        && *blend == b.blend
+        && *opacity == b.opacity
+        && *fill_opacity == b.fill_opacity
+        && *clipped == b.clipped
+        && masks_equal(mask, &b.mask)
+        && *vector_mask == b.vector_mask
+        && *effects == b.effects
+        && *excluded_channels == b.excluded_channels
+        && *blend_if == b.blend_if
+        && match (content, &b.content) {
+            (LayerContent::Raster(x), LayerContent::Raster(y)) => surfaces_equal(x, y),
+            // Children are walked separately; only the group's own clipping frame counts.
+            (LayerContent::Group(x), LayerContent::Group(y)) => x.artboard == y.artboard,
+            (LayerContent::Fill(x), LayerContent::Fill(y)) => x == y,
+            (LayerContent::Adjustment(x), LayerContent::Adjustment(y)) => x == y,
+            (LayerContent::Text(x), LayerContent::Text(y)) => texts_equal(x, y),
+            (LayerContent::Shape(x), LayerContent::Shape(y)) => x == y,
+            (LayerContent::Smart(x), LayerContent::Smart(y)) => smarts_equal(x, y),
+            _ => false,
         }
-        if let Some(m) = &sm.filter_mask {
-            mask_fp(m, h);
+        && match (fill_cache, &b.fill_cache) {
+            (None, None) => true,
+            (Some(x), Some(y)) => x.fill == y.fill && surfaces_equal(&x.surface, &y.surface),
+            _ => false,
         }
-        if let Some(w) = &sm.warp {
-            format!("{w:?}").hash(h);
+}
+
+/// Document-level fields the compositor reads: all must match for a bounded damage claim. The
+/// destructure is exhaustive, so a new `Document` field fails to compile until it is classified
+/// here — compared when it composites, or explicitly ignored (the pixel-irrelevant allowlist:
+/// identity, name, selection, guides, paths, layer comps, annotations, automation state).
+fn doc_pixels_equal(a: &Document, b: &Document) -> bool {
+    let Document {
+        id: _,
+        name: _,
+        size,
+        resolution_dpi,
+        mode,
+        depth,
+        icc_profile,
+        layers: _,
+        channels,
+        guides: _,
+        selection: _,
+        metadata: _,
+        global_light,
+        paths: _,
+        work_path: _,
+        clipping_path: _,
+        quick_mask,
+        patterns,
+        color_table,
+        duotone,
+        layer_comps: _,
+        last_applied_comp: _,
+        last_document_state: _,
+        measurement: _,
+        notes: _,
+        text_styles: _,
+        slices: _,
+        variables: _,
+        timeline: _,
+    } = a;
+    *size == b.size
+        && resolution_dpi.to_bits() == b.resolution_dpi.to_bits()
+        && *mode == b.mode
+        && *depth == b.depth
+        && icc_profile.as_deref() == b.icc_profile.as_deref()
+        && channels.len() == b.channels.len()
+        && channels.iter().zip(&b.channels).all(|(x, y)| alpha_channels_equal(x, y))
+        && *global_light == b.global_light
+        && match (quick_mask, &b.quick_mask) {
+            (None, None) => true,
+            (Some(x), Some(y)) => alpha_channels_equal(x, y),
+            _ => false,
         }
-    }
-    fn effects_fp(e: &photocraft_doc::Effects, h: &mut DefaultHasher) {
-        (e.enabled, format!("{:?}", &e.items), e.reference.map(|(x, y)| (x.to_bits(), y.to_bits()))).hash(h);
-        if let Some(b) = &e.psd_raw {
-            blob(b, h);
-        }
-    }
-    let mut h = DefaultHasher::new();
-    l.id.0.hash(&mut h);
-    l.visible.hash(&mut h);
-    l.blend.hash(&mut h);
-    l.opacity.to_bits().hash(&mut h);
-    l.fill_opacity.to_bits().hash(&mut h);
-    l.clipped.hash(&mut h);
-    l.excluded_channels.hash(&mut h);
-    format!("{:?}", &l.blend_if).hash(&mut h);
-    effects_fp(&l.effects, &mut h);
-    match &l.content {
-        LayerContent::Raster(s) => surf(s, &mut h),
-        LayerContent::Group(g) => {
-            format!("{:?}", &g.artboard).hash(&mut h);
-            for c in &g.children {
-                layer_fp(c).hash(&mut h);
-            }
-        }
-        LayerContent::Fill(_) | LayerContent::Adjustment(_) => format!("{:?}", &l.content).hash(&mut h),
-        LayerContent::Text(t) => text_fp(t, &mut h),
-        LayerContent::Shape(sh) => format!("{sh:?}").hash(&mut h),
-        LayerContent::Smart(sm) => smart_fp(sm, &mut h),
-    }
-    if let Some(fc) = &l.fill_cache {
-        surf(&fc.surface, &mut h);
-    }
-    if let Some(m) = &l.mask {
-        mask_fp(m, &mut h);
-    }
-    if let Some(vm) = &l.vector_mask {
-        (vm.enabled, vm.linked, vm.density.to_bits(), vm.feather.to_bits(), format!("{:?}", &vm.path)).hash(&mut h);
-    }
-    h.finish()
+        && *patterns == b.patterns
+        && *color_table == b.color_table
+        && *duotone == b.duotone
 }
 
 /// Pixels a single history step can have changed between `a` and `b` (the documents on either
-/// side of an undo or redo): the union of the change bounds of every layer whose pixel identity
-/// differs, so undoing a local edit recomposites only that area instead of the whole canvas.
-/// `None` (composite everything, as before) when the step touched the canvas itself (size,
-/// pixel format, colour profile), the layer structure (order, additions, removals, kind
-/// changes), or holds anything the fingerprint cannot bound (video layers).
+/// side of an undo or redo): the union of the change bounds of every layer whose pixels
+/// differ, so undoing a local edit recomposites only that area instead of the whole canvas.
+/// `None` (composite everything, as before) when the step touched anything the layer walk
+/// cannot bound: document-level fields the compositor reads (canvas size, mode, depth,
+/// profile, global light, patterns, channels, palettes), the layer structure (order,
+/// additions, removals, kind changes), layer properties that reach outside their own bounds
+/// (clipping, excluded channels — what `layer.setProps` already reports as unbounded), and
+/// video layers.
 pub fn step_damage(a: &Document, b: &Document) -> Option<Rect> {
-    if a.size != b.size || a.pixel_format() != b.pixel_format() || a.icc_profile != b.icc_profile {
+    if !doc_pixels_equal(a, b) {
         return None;
     }
     fn walk(xs: &[Layer], ys: &[Layer], a: &Document, b: &Document, out: &mut Rect) -> bool {
@@ -497,7 +583,12 @@ pub fn step_damage(a: &Document, b: &Document) -> Option<Rect> {
             if x.id != y.id || x.video.is_some() || y.video.is_some() {
                 return false;
             }
-            if layer_fp(x) != layer_fp(y) {
+            // Clipping and channel exclusion change how *other* layers render, outside this
+            // layer's own bounds; they have no bounded damage.
+            if x.clipped != y.clipped || x.excluded_channels != y.excluded_channels {
+                return false;
+            }
+            if !layer_pixels_equal(x, y) {
                 // Both sides' extents: a move changes pixels where it left and where it landed.
                 let (Some(bx), Some(by)) = (photocraft_compose::change_bounds(x, a.bounds()), photocraft_compose::change_bounds(y, b.bounds())) else {
                     return false;
@@ -1527,6 +1618,35 @@ mod tests {
         s.execute("layer.delete", json!({})).unwrap();
         s.undo();
         assert_eq!(damage(&s), None);
+    }
+
+    #[test]
+    fn undo_of_compositor_read_document_fields_composites_everything() {
+        let mut s = session(8);
+        let _ = rect_layer(&mut s, Rect::new(10, 10, 20, 20));
+        // Global Light changes every effect's angle across the document.
+        s.execute("layer.layerStyle.globalLight", json!({"angle": 90.0})).unwrap();
+        s.undo();
+        assert_eq!(damage(&s), None, "a global-light change recomposites everything");
+        // A mode change that keeps the pixel format (RGB → Indexed maps to RGB) neither.
+        s.execute("image.mode.indexedColor", json!({})).unwrap();
+        s.undo();
+        assert_eq!(damage(&s), None, "a mode change recomposites everything");
+    }
+
+    #[test]
+    fn undo_of_clipping_or_channel_exclusion_composites_everything() {
+        let mut s = session(8);
+        let _ = rect_layer(&mut s, Rect::new(10, 10, 20, 20));
+        let b = rect_layer(&mut s, Rect::new(12, 12, 30, 30));
+        select_all(&mut s, &[b]);
+        // Clipping reaches the layers clipped above, outside this layer's bounds.
+        s.execute("layer.setProps", json!({"clipped": true})).unwrap();
+        s.undo();
+        assert_eq!(damage(&s), None, "a clipping change recomposites everything");
+        s.execute("layer.setProps", json!({"channels": [true, false, true]})).unwrap();
+        s.undo();
+        assert_eq!(damage(&s), None, "an excluded-channel change recomposites everything");
     }
 
     #[test]
