@@ -238,12 +238,38 @@ pub fn histogram_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let stale = !matches!(&app.doc_hist, Some((d, r, _, _)) if *d == doc_id && *r == rev);
     let due = app.doc_hist.as_ref().is_none_or(|(d, _, at, _)| *d != doc_id || now - at > 250.0);
     if stale && due {
-        let t0 = now;
-        let h = Arc::new(compute_histograms(&st.doc, HistSource::BelowLayer(LayerId(u64::MAX)), ToneSpace::Rgb));
-        app.perf.span("histogram", crate::gpu_canvas::now_ms() - t0);
-        app.doc_hist = Some((doc_id, rev, now, h));
+        // Computed off the UI thread (doc clone + proxy + pixel counts cost tens of ms on
+        // large documents): the panel keeps showing the previous histogram with the existing
+        // "cached data" warning until the worker delivers.
+        let pending = app.hist_job.as_ref().is_some_and(|(d, r, _)| *d == doc_id && *r == rev);
+        if !pending {
+            let doc = st.doc.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = ui.ctx().clone();
+            let t0 = now;
+            std::thread::Builder::new()
+                .name("histogram".into())
+                .spawn(move || {
+                    let h = Arc::new(compute_histograms(&doc, HistSource::BelowLayer(LayerId(u64::MAX)), ToneSpace::Rgb));
+                    let _ = tx.send((doc.id, doc.name.clone(), h));
+                    ctx.request_repaint();
+                })
+                .ok();
+            app.hist_job = Some((doc_id, rev, rx));
+            let _ = t0;
+        }
     } else if stale {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(260));
+    }
+    // A finished worker lands its histogram; the revision check keeps a stale result from
+    // overwriting a newer one.
+    if let Some((jd, jr, rx)) = &app.hist_job
+        && let Ok((_, _, h)) = rx.try_recv()
+    {
+        if *jd == doc_id {
+            app.doc_hist = Some((doc_id, *jr, crate::gpu_canvas::now_ms(), h));
+        }
+        app.hist_job = None;
     }
     let Some((_, _, _, h)) = app.doc_hist.clone() else { return };
     let size = app.session.active().map_or(photocraft_doc::Size::new(0, 0), |s| s.doc.size);
@@ -317,5 +343,67 @@ mod tests {
         assert!(h[0][255] > 0 && h[0][0] == 0, "the black layer above is hidden");
         assert_eq!(compute_histograms(&st.doc, HistSource::Layer(bg), ToneSpace::Cmyk).ch.len(), 5);
         assert_eq!(compute_histograms(&st.doc, HistSource::Layer(bg), ToneSpace::Lab).ch.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod hist_async_tests {
+    use super::*;
+    use crate::PhotocraftApp;
+    use serde_json::json;
+
+    /// The panel schedules the histogram on a worker and keeps showing the previous data
+    /// until it lands: right after the trigger the job exists (nothing computed in this
+    /// frame), the receiver delivers, and a stale result cannot overwrite a newer revision.
+    #[test]
+    fn histogram_payload_cost_is_the_frame_stall_we_removed() {
+        // The stall the worker removes: compute_histograms inline on a 24 MP document.
+        let mut doc =
+            photocraft_doc::Document::new("big", photocraft_doc::Size::new(6000, 4000), photocraft_color::ColorMode::Rgb, photocraft_color::SampleType::U8);
+        let mut base = photocraft_doc::Layer::new("bg", photocraft_doc::LayerContent::Raster(photocraft_raster::Surface::new(doc.pixel_format())));
+        base.surface_mut().unwrap().fill_rect(photocraft_geom::Rect::from_size(photocraft_doc::Size::new(6000, 4000)), &[0.5, 0.5, 0.5, 1.0]);
+        doc.layers.push(base);
+        let t0 = std::time::Instant::now();
+        let h = compute_histograms(&doc, HistSource::BelowLayer(LayerId(u64::MAX)), ToneSpace::Rgb);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(!h.ch.is_empty());
+        println!("inline compute_histograms on 24 MP: {ms:.1} ms (this was the per-250 ms frame stall; the worker removes it)");
+        assert!(ms < 2000.0, "sanity: {ms}");
+    }
+
+    #[test]
+    fn panel_histogram_is_computed_off_the_ui_thread() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let ctx = egui::Context::default();
+        let _ = &ctx;
+        app.run("file.new", json!({"width": 640, "height": 480})).unwrap();
+        let (doc_id, rev) = {
+            let st = app.session.active().unwrap();
+            (st.doc.id, st.revision)
+        };
+        // Drive one panel frame through a minimal egui pass.
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        let panel_ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("hist-test"),
+            egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 200.0))),
+        );
+        let mut panel_ui = panel_ui;
+        histogram_panel(&mut app, &mut panel_ui);
+        let job = app.hist_job.take().expect("the panel scheduled a worker");
+        assert_eq!(job.0, doc_id);
+        assert_eq!(job.1, rev);
+        // The worker delivers (its repaint request is a no-op outside a frame).
+        let (did, _, h) = job.2.recv().expect("the worker delivers the histogram");
+        assert_eq!(did, doc_id);
+        assert!(!h.ch.is_empty(), "the histogram has data");
+        // Delivering it for the revision it was computed from lands in the cache.
+        app.doc_hist = Some((doc_id, rev, crate::gpu_canvas::now_ms(), h.clone()));
+        // …and a newer revision keeps the old entry stale instead of being overwritten by it.
+        app.run("layer.new.layer", json!({})).unwrap();
+        let rev2 = app.session.active().unwrap().revision;
+        assert_ne!(rev, rev2);
+        assert_ne!(app.doc_hist.as_ref().unwrap().1, rev2, "stale after an edit");
     }
 }
