@@ -142,11 +142,11 @@ pub fn parse_cube(text: &str) -> Result<LutFile, LutError> {
             _ => {}
         }
     }
+    let domain_ok = (0..3).all(|k| dmin[k] < dmax[k] && dmin[k].is_finite() && dmax[k].is_finite());
+    if (size3 > 0 || size1 >= 2) && !domain_ok {
+        return err(format!("DOMAIN_MIN {:?} must lie below DOMAIN_MAX {:?}", dmin, dmax));
+    }
     if size3 > 0 {
-        let domain_ok = (0..3).all(|k| dmin[k] < dmax[k] && dmin[k].is_finite() && dmax[k].is_finite());
-        if !domain_ok {
-            return err(format!("DOMAIN_MIN {:?} must lie below DOMAIN_MAX {:?}", dmin, dmax));
-        }
         return LutFile { title, size: size3, data: rows, domain_min: dmin, domain_max: dmax }.check();
     }
     if size1 >= 2 {
@@ -154,8 +154,12 @@ pub fn parse_cube(text: &str) -> Result<LutFile, LutError> {
         if rows.len() != expected_rows {
             return err("no LUT_3D_SIZE in .cube file");
         }
+        // The 1D table is resampled onto a 0..1 cube anyway, so its input domain
+        // (`DOMAIN_MIN`/`MAX`, `LUT_1D_INPUT_RANGE`) is baked into the resample: an input `v`
+        // reads the table at `(v - min) / (max - min)`, saturating outside.
         let curve = |ch: usize, v: f32| {
-            let x = v.clamp(0.0, 1.0) * (size1 - 1) as f32;
+            let t = (v - dmin[ch]) / (dmax[ch] - dmin[ch]);
+            let x = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 } * (size1 - 1) as f32;
             let i = (x.floor() as usize).min(size1 - 2);
             let f = x - i as f32;
             rows[i * 3 + ch] * (1.0 - f) + rows[(i + 1) * 3 + ch] * f
@@ -331,6 +335,28 @@ DOMAIN_MAX 0.5 1 1
 {base}{rows}"
         ))
         .unwrap_err();
+        assert!(e.0.contains("below DOMAIN_MAX"), "{e}");
+    }
+
+    #[test]
+    fn cube_1d_domain_is_baked_into_the_resample() {
+        // An identity ramp over the domain 0.25..0.75: 0.25 maps to 0, 0.5 to 0.5, 0.75 to 1.
+        let table = "LUT_1D_SIZE 2\nLUT_1D_INPUT_RANGE 0.25 0.75\n0 0 0\n1 1 1\n";
+        let l = parse_cube(table).expect("1D with input range");
+        assert!(l.domain_is_default(), "the domain is baked in, so the cube is plain 0..1");
+        let at = |r: usize| l.data[r * 3];
+        // 33-point grid, red fastest: entry r on the red axis is input r / 32.
+        assert!(at(0).abs() < 1e-6, "below the domain saturates to 0");
+        assert!((at(16) - 0.5).abs() < 1e-5, "0.5 is the middle of 0.25..0.75: {}", at(16));
+        assert!((at(8) - 0.0).abs() < 1e-5, "0.25 maps to 0: {}", at(8));
+        assert!((at(24) - 1.0).abs() < 1e-5, "0.75 maps to 1: {}", at(24));
+        assert!((at(32) - 1.0).abs() < 1e-6, "above the domain saturates to 1");
+        // Per-channel DOMAIN_MIN/MAX work the same way.
+        let l = parse_cube("LUT_1D_SIZE 2\nDOMAIN_MIN 0 0 0.5\nDOMAIN_MAX 1 1 1\n0 0 0\n1 1 1\n").expect("1D domain");
+        let blue_mid = l.data[(16 * 33 * 33) * 3 + 2];
+        assert!(blue_mid.abs() < 1e-5, "blue 0.5 is the bottom of its domain: {blue_mid}");
+        // A degenerate 1D domain is rejected like the 3D one.
+        let e = parse_cube("LUT_1D_SIZE 2\nLUT_1D_INPUT_RANGE 1 1\n0 0 0\n1 1 1\n").unwrap_err();
         assert!(e.0.contains("below DOMAIN_MAX"), "{e}");
     }
 
