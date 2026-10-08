@@ -30,6 +30,7 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("window.panel.activate", "Activate Panel", &[], None),
     ("window.panel.close", "Close Panel", &[], None),
     ("file.open", "Open…", &["File"], Some("Cmd+O")),
+    ("file.openDeep", "Open as Deep…", &["File"], None),
     ("file.save", "Save", &["File"], Some("Cmd+S")),
     ("file.saveAs", "Save As…", &["File"], Some("Cmd+Shift+S")),
     ("file.exit", "Exit", &["File"], Some("Cmd+Q")),
@@ -277,6 +278,24 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
                 open_path(app, path)
             } else {
                 app.open_dialog_file()
+            }
+        }
+        "file.openDeep" => {
+            if let Some(path) = params.get("path").and_then(Value::as_str) {
+                app.open_path_deep(path)?;
+                Ok(Value::Null)
+            } else {
+                // The multi-file picker of File › Open, with the depth kept.
+                if let Some(pick_paths) = app.services.pick_open_paths.as_mut()
+                    && let Some(paths) = pick_paths()
+                {
+                    for path in paths {
+                        if let Err(e) = app.open_path_deep(&path) {
+                            app.open_failed(&crate::file_open::display_name(&path), &e);
+                        }
+                    }
+                }
+                Ok(Value::Null)
             }
         }
         "file.save" => {
@@ -622,7 +641,7 @@ pub fn is_enabled(app: &PhotocraftApp, id: &str) -> bool {
         "window.panel.group" | "window.panel.move" | "window.panel.float" | "window.panel.dock" | "window.panel.close" => !app.session.prefs().workspace_locked,
         "file.open" | "file.exit" | "file.clearRecent" | "file.removeRecent" | "help.about" | "help.systemInfo" | "edit.search" => true,
         i if i.starts_with("file.openRecent.") => true,
-        i if crate::links::url_for(i).is_some() => true,
+"file.open" | "file.openDeep" | "file.exit" | "file.clearRecent" | "file.removeRecent" | "help.about" | "help.systemInfo" | "edit.search" => true,        i if i.starts_with("file.openRecent.") => true,        i if crate::links::url_for(i).is_some() => true,
         i if i.starts_with("window.theme.") => true,
         "file.save" | "file.saveAs" | "file.export.exportAs" | "file.export.quickExportAsPng" => {
             app.session.active().is_some() && app.services.export.is_some()
