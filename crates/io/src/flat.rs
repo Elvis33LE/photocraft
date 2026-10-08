@@ -391,15 +391,33 @@ fn cmyk_image_to_srgb(img: &Image) -> Result<Image, IoError> {
     let t = Transform::new(&src, dst, Intent::RelativeColorimetric, true).map_err(|e| IoError::Unsupported(e.to_string()))?;
     let alpha = img.layout().has_alpha();
     let (ss, ds) = (if alpha { 5 } else { 4 }, if alpha { 4 } else { 3 });
-    let vals = img.to_normalized();
-    let mut out = vec![0.0f32; img.pixel_count() * ds];
-    t.convert_f32(&vals, ss, &mut out, ds, true);
     let (w, h) = img.dimensions();
     let layout = if alpha { ChannelLayout::Rgba } else { ChannelLayout::Rgb };
     let sample = match img.sample_type() {
         CSample::F16 => CSample::F32,
         s => s,
     };
+    // Row bands through the transform: three full-size f32 buffers (normalized input, the
+    // transform's working set, sRGB output) become band-height slices — ~1.4 GB of allocation
+    // churn at 36 MP before this. `convert_f32` walks plain strided slices, so bands are free.
+    let row = w as usize;
+    let src_bpp = img.layout().channels() * img.sample_type().bytes();
+    let band_rows = (BAND_BYTES / (row * ss * 4)).clamp(1, h as usize).max(1);
+    let mut out = Vec::with_capacity(img.pixel_count() * ds);
+    let mut vals: Vec<f32> = Vec::with_capacity(band_rows * row * ss);
+    // Whole bands of rows only: a trailing partial row (h not a multiple of band_rows, or a
+    // 1-row image smaller than the band budget) is folded into the last band.
+    let mut idx = 0usize;
+    while idx < h as usize {
+        let n = band_rows.min(h as usize - idx);
+        let rows = &img.data()[idx * row * src_bpp..(idx + n) * row * src_bpp];
+        idx += n;
+        vals.clear();
+        vals.extend(Image::from_raw(w, n as u32, img.layout(), img.sample_type(), rows.to_vec())?.to_normalized());
+        let mut dst_band = vec![0.0f32; n * row * ds];
+        t.convert_f32(&vals, ss, &mut dst_band, ds, true);
+        out.extend_from_slice(&dst_band);
+    }
     Ok(Image::from_normalized(w, h, layout, sample, &out)?.with_icc(Some(dst.to_bytes().to_vec())).with_meta(img.meta.clone()))
 }
 
