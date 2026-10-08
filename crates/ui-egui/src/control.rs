@@ -334,6 +334,8 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
                     Some(v) => serde_json::from_value(v.clone()).map(Some).map_err(|e| format!("brushPickerView: {e} (list, grid)"))?,
                     None => None,
                 };
+                // `Some(None)` is an explicit null, which closes the picker (a missing field
+                // leaves it alone).
                 let brush_picker = match p.get("brushPicker") {
                     Some(v) => {
                         let at = serde_json::from_value::<Option<[f32; 2]>>(v.clone())
@@ -341,13 +343,8 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
                         if at.is_some_and(|[x, y]| !x.is_finite() || !y.is_finite()) {
                             return Err("brushPicker must be [x, y] in screen points, or null to close it".into());
                         }
-                        at
+                        Some(at)
                     }
-                    None => None,
-                };
-                // Which chip the Color panel edits.
-                let color_panel = match p.get("colorPanel") {
-                    Some(c) => serde_json::from_value(c.clone()).map(Some).map_err(|e| e.to_string())?,
                     None => None,
                 };
                 // brushSize rides the journaled `tools.setBrush` command (#744). Numeric values
@@ -438,7 +435,7 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
                     app.ui.brush_picker_list.view = v;
                 }
                 if let Some(at) = brush_picker {
-                    app.ui.brush_picker = Some(at);
+                    app.ui.brush_picker = at;
                 }
                 // Which chip the Color panel edits.
                 if let Some(c) = color_panel {
@@ -918,9 +915,6 @@ mod tests {
         assert_eq!(call(&mut app, &ctx, "ui.set", json!({"brushPicker": null}))["ok"], true);
         assert_eq!(app.ui.brush_picker, None);
     }
-
-    #[test]
-    fn ui_set_color_panel_picks_the_edited_chip() {}
 
     #[test]
     fn ui_set_applies_all_fields_or_none() {
