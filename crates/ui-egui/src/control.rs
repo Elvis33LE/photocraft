@@ -9,6 +9,7 @@
 //! - `ui.inspect`: full UI state (tool, panels, views, dialogs, windows, window size); the menu
 //!   tree is `ui.menu.list`
 //! - `ui.set {tool?, panels?, dock?, dockTabs?, dockWidth?, colorPanel?, maskTarget?, vectorMaskTarget?, selectionMode?, zoom?, center?, fit?, theme?, brushSection?, brushTab?, brushesView?, brushPicker?, brushPickerView?, brushSize?}`:
+//! - `ui.set {tool?, panels?, dock?, dockTabs?, dockWidth?, colorPanel?, maskTarget?, vectorMaskTarget?, selectionMode?, zoom?, center?, fit?, theme?, brushSection?, brushTab?, brushesView?, brushSize?}`:
 //!   change UI state; any other field is an error ([`UI_SET_FIELDS`])
 //! - `ui.dialog.open {kind, fields?}` (kinds: newDocument, about, layerStyle {effect?}, colorPicker {target: foreground|background}, command {command}) / `ui.dialog.set {dialog, field, value}` / `ui.dialog.confirm {dialog, wait?}` / `ui.dialog.cancel {dialog}`
 //! - `ui.dialog.apply {dialog}`: commit Preferences changes without closing the dialog
@@ -128,9 +129,9 @@ fn num_field(p: &Value, key: &str) -> std::result::Result<Option<f64>, String> {
     }
 }
 
-/// A `ui.set` object field (e.g. `panels`): the patch's keys are merged into the serialized
-/// current value and parsed back, so a non-object value or an unknown nested key is an error —
-/// a nested typo must not reply ok while changing nothing.
+/// A `ui.set` object field merged into the current state (e.g. `panels`): the patch's keys are
+/// merged into the serialized current value and parsed back, so a non-object value or an
+/// unknown nested key is an error — a nested typo must not reply ok while changing nothing.
 fn merged_object<T: serde::Serialize + serde::de::DeserializeOwned>(current: &T, patch: Option<&Value>, field: &str) -> std::result::Result<Option<T>, String> {
     let Some(patch) = patch else { return Ok(None) };
     let Some(patch) = patch.as_object() else { return Err(format!("{field} must be an object")) };
@@ -145,6 +146,22 @@ fn merged_object<T: serde::Serialize + serde::de::DeserializeOwned>(current: &T,
         }
     }
     serde_json::from_value(cur).map(Some).map_err(|e| format!("{field}: {e}"))
+}
+
+/// A `ui.set` object field applied by whole-value replacement (e.g. `dock`, `colorPanel`):
+/// unknown nested keys are rejected like [`merged_object`] does, but the value replaces the
+/// state instead of merging into it.
+fn whole_object<T: serde::Serialize + serde::de::DeserializeOwned>(current: &T, v: Option<&Value>, field: &str) -> std::result::Result<Option<T>, String> {
+    let Some(v) = v else { return Ok(None) };
+    let Some(patch) = v.as_object() else { return Err(format!("{field} must be an object")) };
+    let cur = serde_json::to_value(current).map_err(|e| e.to_string())?;
+    let known: std::collections::HashSet<&str> = cur.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+    for k in patch.keys() {
+        if !known.contains(k.as_str()) {
+            return Err(format!("unknown {field} field `{k}`"));
+        }
+    }
+    serde_json::from_value(v.clone()).map(Some).map_err(|e| format!("{field}: {e}"))
 }
 fn wrap(r: Result<Value, String>) -> Outcome {
     match r {
@@ -183,6 +200,16 @@ fn screen_point(app: &PhotocraftApp, x: f64, y: f64) -> [f32; 2] {
 }
 
 pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
+    let saved = app.session.authorize;
+    if let Some(gate) = app.services.automation_authorize {
+        app.session.authorize = Some(gate);
+    }
+    let outcome = dispatch(app, ctx, req);
+    app.session.authorize = saved;
+    outcome
+}
+
+fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
     let p = &req.params;
     let s = |k: &str| p.get(k).and_then(Value::as_str);
     let u = |k: &str| p.get(k).and_then(Value::as_u64);
@@ -268,15 +295,17 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
                 let vector_mask_target = bool_field(p, "vectorMaskTarget")?;
                 let selection_mode = uint_field(p, "selectionMode")?;
                 let dock_tabs = merged_object(&app.ui.dock_tabs, p.get("dockTabs"), "dockTabs")?;
-                let dock = match p.get("dock") {
-                    Some(d) => serde_json::from_value(d.clone()).map(Some).map_err(|e| format!("dock: {e}"))?,
-                    None => None,
-                };
+                let dock = whole_object(&app.ui.dock, p.get("dock"), "dock")?;
+                // Which chip the Color panel edits.
+                let color_panel = whole_object(&app.ui.color_panel, p.get("colorPanel"), "colorPanel")?;
                 let dock_width = num_field(p, "dockWidth")?;
                 let zoom = num_field(p, "zoom")?;
                 let center = match p.get("center") {
                     Some(v) => {
                         let a = v.as_array().ok_or_else(|| "center must be [x, y]".to_string())?;
+                        if a.len() != 2 {
+                            return Err("center must be exactly [x, y]".into());
+                        }
                         let (Some(x), Some(y)) = (a.first().and_then(Value::as_f64), a.get(1).and_then(Value::as_f64)) else {
                             return Err("center must be [x, y] of two numbers".into());
                         };
@@ -321,9 +350,18 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
                     Some(c) => serde_json::from_value(c.clone()).map(Some).map_err(|e| e.to_string())?,
                     None => None,
                 };
-                // The Brush Settings panel's range: out-of-range values clamp instead of
-                // producing an unusable (or infinite) tip size.
-                let brush_size = num_field(p, "brushSize")?.map(|v| v.clamp(0.5, 5000.0) as f32);
+                // brushSize rides the journaled `tools.setBrush` command (#744). Numeric values
+                // are validated here so the command cannot fail after other fields were
+                // applied; non-numeric values keep the API's historical silent no-op.
+                let brush_size: Option<f64> = match p.get("brushSize").and_then(Value::as_f64) {
+                    Some(size) => {
+                        if !size.is_finite() || size > f64::from(photocraft_paint::MAX_BRUSH_SIZE) {
+                            return Err(format!("brushSize must be finite and at most {} px", photocraft_paint::MAX_BRUSH_SIZE));
+                        }
+                        Some(size)
+                    }
+                    None => None,
+                };
 
                 // Apply (nothing below can fail).
                 if let Some(t) = tool {
@@ -361,6 +399,9 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
                 if let Some(v) = dock {
                     app.ui.dock = v;
                 }
+                if let Some(v) = color_panel {
+                    app.ui.color_panel = v;
+                }
                 // Right dock width in points (clamped to the dock's 250..=520 range), applied next frame.
                 if let Some(w) = dock_width {
                     crate::panels::request_dock_width(ctx, w as f32);
@@ -369,13 +410,16 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
                     if let Some(z) = zoom {
                         app.ui.views[i].zoom = (z as f32).clamp(0.01, 64.0);
                         app.ui.views[i].fit_pending = false;
+                        app.ui.views[i].fill_pending = false;
                     }
                     if let Some(c) = center {
                         app.ui.views[i].center = c;
                         app.ui.views[i].fit_pending = false;
+                        app.ui.views[i].fill_pending = false;
                     }
                     if fit {
                         app.ui.views[i].fit_pending = true;
+                        app.ui.views[i].fill_pending = false;
                     }
                 }
                 if let Some(k) = theme {
@@ -394,14 +438,14 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
                     app.ui.brush_picker_list.view = v;
                 }
                 if let Some(at) = brush_picker {
-                    app.ui.brush_picker = at;
+                    app.ui.brush_picker = Some(at);
                 }
                 // Which chip the Color panel edits.
                 if let Some(c) = color_panel {
                     app.ui.color_panel = c;
                 }
                 if let Some(size) = brush_size {
-                    app.session.tools.brush.size = size;
+                    app.run("tools.setBrush", json!({"brush": {"size": size}})).map_err(|e| e.to_string())?;
                 }
                 Ok(Value::Null)
             })();
@@ -650,13 +694,11 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
                     None => Err("automation read authority is not configured".into()),
                 };
                 wrap(opened.and_then(|(name, bytes)| {
+                    let name = app.open_name(&name);
                     let warnings = app.open_automation_bytes(&name, &bytes)?;
                     // Brushes/gradients go to the preset libraries: no document, no Open Recent entry.
                     if !crate::preset_files_ui::is_preset_file(&name) {
-                        if let Some(state) = app.session.active_mut() {
-                            state.path = Some(path.to_string());
-                        }
-                        app.push_recent(path);
+                        app.opened_from(path);
                     }
                     Ok(json!({"path": path, "name": name, "warnings": warnings}))
                 }))
@@ -682,6 +724,7 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
         "window": {"width": screen.width(), "height": screen.height(), "pixelsPerPoint": ctx.pixels_per_point()},
         "tool": app.ui.tool,
         "toolOptions": app.ui.tool_options,
+        "magnetic": app.ui.magnetic,
         "textEdit": app.ui.text_edit,
         "layerMenu": app.ui.layer_menu,
         "canvasToolMenu": app.ui.canvas_tool_menu.as_ref().map(|menu| {
@@ -710,7 +753,7 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
         "brush": {"size": app.session.tools.brush.size, "hardness": app.session.tools.brush.hardness, "opacity": app.session.tools.brush.opacity},
         "distort": app.distort.describe(),
         "jobs": crate::jobs_ui::inspect(app),
-        "cameraRaw": app.camera_raw.as_ref().map(|d| d.describe(&app.ui.camera_raw_scope)),
+        "cameraRaw": app.camera_raw.as_ref().map(|d| d.describe(&app.ui.camera_raw_scope, &app.ui.camera_raw_preview)),
     })
 }
 
@@ -886,36 +929,43 @@ mod tests {
         let ctx = egui::Context::default();
         let before = app.ui.tool;
         let panels_before = serde_json::to_value(&app.ui.panels).unwrap_or_default();
-        // A late invalid field must not leave the earlier valid one applied.
-        let r = call(&mut app, &ctx, "ui.set", json!({"tool": "move", "theme": "nope"}));
-        assert_eq!(r["ok"], false, "{r}");
-        assert_eq!(app.ui.tool, before, "a rejected call applies none of its fields");
-        // Wrong types and unknown nested keys are errors now, not silent no-ops with ok:true.
+        // A late invalid field must not leave the earlier valid one applied - including the
+        // journaled brush command, which is validated up front for exactly this reason.
+        for params in
+            [json!({"tool": "move", "theme": "nope"}), json!({"tool": "move", "brushSize": 1e300}), json!({"tool": "move", "colorPanel": {"nope": true}})]
+        {
+            let r = call(&mut app, &ctx, "ui.set", params.clone());
+            assert_eq!(r["ok"], false, "{params}: {r}");
+            assert_eq!(app.ui.tool, before, "{params}: a rejected call applies none of its fields");
+        }
+        // Wrong types and unknown nested keys are errors, not silent no-ops with ok:true.
         for params in [
             json!({"panels": "x"}),
             json!({"panels": {"nope": true}}),
             json!({"dockTabs": {"nope": 1}}),
+            json!({"dock": {"nope": 1}}),
             json!({"center": [1]}),
+            json!({"center": [1, 2, 3]}),
             json!({"center": "here"}),
-            json!({"brushSize": "big"}),
+            json!({"colorPanel": "x"}),
             json!({"selectionMode": "add"}),
         ] {
             let r = call(&mut app, &ctx, "ui.set", params.clone());
             assert_eq!(r["ok"], false, "{params}: {r}");
         }
         assert_eq!(serde_json::to_value(&app.ui.panels).unwrap_or_default(), panels_before, "nothing was applied");
+        // Non-numeric brushSize keeps the API's historical silent no-op (see the dispatch test).
+        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"brushSize": "large"}))["ok"], true);
     }
 
     #[test]
-    fn ui_set_brush_size_clamps_into_the_panel_range() {
+    fn ui_set_color_panel_picks_the_edited_chip() {
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
         let ctx = egui::Context::default();
-        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"brushSize": 1e300}))["ok"], true);
-        assert_eq!(app.session.tools.brush.size, 5000.0, "an enormous size clamps, it does not become inf");
-        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"brushSize": -5.0}))["ok"], true);
-        assert_eq!(app.session.tools.brush.size, 0.5);
-        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"brushSize": 42.0}))["ok"], true);
-        assert_eq!(app.session.tools.brush.size, 42.0);
+        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"colorPanel": {"background": true}}))["ok"], true);
+        assert!(app.ui.color_panel.background);
+        assert_eq!(call(&mut app, &ctx, "ui.set", json!({"colorPanel": {"background": "yes"}}))["ok"], false);
+        assert!(app.ui.color_panel.background, "a bad value changes nothing");
     }
 
     #[test]
@@ -948,6 +998,37 @@ mod tests {
         assert_eq!(app.session.active_index(), before, "the active document is untouched");
         // A valid index still opens the window.
         assert_eq!(call(&mut app, &ctx, "ui.window.open", json!({"document": 0}))["ok"], true);
+    }
+
+    #[test]
+    fn ui_set_brush_size_dispatches_a_journaled_brush_command() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let ctx = egui::Context::default();
+
+        let r = call(&mut app, &ctx, "ui.set", json!({"brushSize": 42.5}));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(app.session.tools.brush.size, 42.5);
+        let (id, params) = app.session.journal.last().cloned().expect("brush change is journaled");
+        assert_eq!(id, "tools.setBrush");
+        assert_eq!(params, json!({"brush": {"size": 42.5}}));
+
+        // The control API has historically ignored non-numeric optional values.
+        for params in [json!({}), json!({"brushSize": null}), json!({"brushSize": "large"}), json!({"brushSize": true})] {
+            let journal_len = app.session.journal.len();
+            let r = call(&mut app, &ctx, "ui.set", params);
+            assert_eq!(r["ok"], true, "{r}");
+            assert_eq!(app.session.tools.brush.size, 42.5);
+            assert_eq!(app.session.journal.len(), journal_len);
+        }
+
+        // Values that cannot be represented by BrushSettings must report the command error and
+        // leave both the brush and journal unchanged instead of mutating tool state directly.
+        let journal_len = app.session.journal.len();
+        let r = call(&mut app, &ctx, "ui.set", json!({"brushSize": f64::MAX}));
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r["error"].as_str().is_some(), "{r}");
+        assert_eq!(app.session.tools.brush.size, 42.5);
+        assert_eq!(app.session.journal.len(), journal_len);
     }
 
     #[test]
@@ -1054,5 +1135,59 @@ mod tests {
         let r = call(&mut app, &ctx, "app.save", json!({}));
         assert_eq!(r["result"]["path"], "in/layered.psd", "{r}");
         assert_eq!(written.borrow().last().map(String::as_str), Some("in/layered.psd"));
+        // A template opens untitled, so a save without `path` never writes over it.
+        let r = call(&mut app, &ctx, "app.open", json!({"path": "in/card.psdt"}));
+        assert_eq!(r["result"]["name"], "Untitled-1", "{r}");
+        assert_eq!(app.session.active().unwrap().path, None);
+        let r = call(&mut app, &ctx, "app.save", json!({}));
+        assert!(r["error"].as_str().unwrap().contains("pass `path`"), "{r}");
+    }
+
+    fn deny_ambient_file(id: &str, _: &serde_json::Value) -> photocraft_engine::Result<()> {
+        if id.starts_with("file.") && id != "file.new" {
+            Err(photocraft_engine::EngineError::Other(format!("automation command `{id}` is disabled")))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn actions_play_checks_each_step_over_control() {
+        let services = crate::Services { automation_authorize: Some(deny_ambient_file), ..Default::default() };
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
+        app.session.actions.list.push(photocraft_engine::actions_cmds::Action {
+            name: "Open".into(),
+            steps: vec![("file.open".into(), json!({"path": "/etc/passwd"})), ("layer.new.layer".into(), json!({}))],
+        });
+        let ctx = egui::Context::default();
+        let r = call(&mut app, &ctx, "engine.execute", json!({"command": "actions.play", "params": {"action": "Open"}}));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["result"]["ran"], 0, "{r}");
+        assert_eq!(r["result"]["failed"]["id"], "file.open", "{r}");
+        assert!(r["result"]["failed"]["error"].as_str().unwrap_or("").contains("disabled"), "{r}");
+        assert!(app.session.documents().is_empty());
+        assert!(app.session.authorize.is_none(), "the per-step gate is only installed for the request");
+    }
+
+    #[test]
+    fn actions_play_checks_each_step_for_synthetic_input() {
+        let services = crate::Services { automation_authorize: Some(deny_ambient_file), ..Default::default() };
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
+        app.session.actions.list.push(photocraft_engine::actions_cmds::Action {
+            name: "Open".into(),
+            steps: vec![("file.open".into(), json!({"path": "/etc/passwd"})), ("layer.new.layer".into(), json!({}))],
+        });
+        app.automation_input = true;
+        let r = app.run("actions.play", json!({"action": "Open"})).unwrap();
+        assert_eq!(r["ran"], 0, "{r}");
+        assert_eq!(r["failed"]["id"], "file.open", "{r}");
+        assert!(app.session.authorize.is_none(), "the per-step gate is only installed for the command");
+
+        // A local play (no automation input) still runs recorded steps.
+        app.automation_input = false;
+        app.session.actions.list[0].steps.remove(0);
+        app.session.execute("file.new", json!({"width": 4, "height": 4})).unwrap();
+        let r = app.run("actions.play", json!({"action": "Open"})).unwrap();
+        assert_eq!(r["ran"], 1, "{r}");
     }
 }
