@@ -684,6 +684,18 @@ mod tests {
         assert_eq!(tr_ctx(de, "layerLabel", "No Color"), "Keine Farbe");
         assert_eq!(tr_ctx(de, "layerLabel", "Seafoam"), "Meeresschaum");
         assert_eq!(tr(Lang::EN, "Seafoam"), "Seafoam");
+    /// Font style labels are built from dynamic words (weights, "Italic"), so the literal
+    /// scanner cannot cover them; "Light" there is a weight, distinct from the Camera Raw
+    /// "Light" section (`type_tool::style_label`).
+    #[test]
+    fn font_weight_names_are_translated() {
+        const TERMS: &[&str] = &["Thin", "ExtraLight", "Light", "Regular", "Medium", "SemiBold", "Bold", "ExtraBold", "Black", "Italic"];
+        for lang in Lang::all().filter(|l| l.complete_menus()) {
+            for t in TERMS {
+                assert!(lang.0.catalog().contextual("fontWeight", t).is_some(), "{} missing font weight: {t}", lang.code());
+            }
+            assert_ne!(tr_ctx(lang, "cameraRaw", "Light"), tr_ctx(lang, "fontWeight", "Light"), "{}: Camera Raw Light vs the font weight", lang.code());
+        }
     }
 
     /// Blend mode names come from the colour crate; each must be translated.
