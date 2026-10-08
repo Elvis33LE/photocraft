@@ -1242,6 +1242,10 @@ fn layer_identity(layer: &Layer, h: &mut std::collections::hash_map::DefaultHash
     match &layer.content {
         LayerContent::Group(g) => {
             for c in &g.children {
+                // A styled group's maps come from its children's composite, so how each child
+                // composites (unlike the group's own visibility and opacity) shapes them.
+                (c.visible, c.opacity.to_bits(), c.clipped).hash(h);
+                format!("{:?}", c.blend).hash(h);
                 layer_identity(c, h);
             }
             format!("{:?}", g.artboard).hash(h);

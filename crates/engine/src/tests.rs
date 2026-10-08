@@ -469,6 +469,46 @@ fn fill_layer_pixel_rewrites_refresh_the_effect_maps() {
 }
 
 #[test]
+fn group_effect_maps_follow_child_visibility_and_opacity() {
+    // A styled group's maps come from its children's composite: hiding a child or changing its
+    // opacity must refresh the group's shadow. Warm render vs. purged render must agree.
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48, "background": "transparent"})).unwrap();
+    let a = s.execute("layer.new.layer", json!({})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("paint.pencil", json!({"points": [[20, 24]], "size": 12, "color": "#ff0000"})).unwrap();
+    let b = s.execute("layer.new.layer", json!({})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("paint.pencil", json!({"points": [[44, 24]], "size": 12, "color": "#0000ff"})).unwrap();
+    let g = s.execute("layer.new.group", json!({})).unwrap()["layer"].as_u64().unwrap();
+    for l in [a, b] {
+        s.execute("layer.moveTo", json!({"layer": l, "target": g, "position": "into"})).unwrap();
+    }
+    s.edit("shadow", |doc, _| {
+        doc.layer_mut(LayerId(g)).unwrap().effects.items.push(photocraft_doc::Effect::default_drop_shadow());
+        Ok(())
+    })
+    .unwrap();
+    let render = |s: &Session| {
+        let d = &s.active().unwrap().doc;
+        photocraft_compose::render(d, d.bounds()).px
+    };
+    let mut prev = render(&s); // populate the effect-map cache
+    let edits: [(&str, fn(&mut photocraft_doc::Layer)); 2] = [("hide", |l| l.visible = false), ("opacity", |l| l.opacity = 0.3)];
+    for ((name, edit), child) in edits.into_iter().zip([a, b]) {
+        let child = LayerId(child);
+        s.edit(name, |doc, _| {
+            edit(doc.layer_mut(child).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        let warm = render(&s);
+        assert_ne!(warm, prev, "{name}: the composite changes");
+        photocraft_compose::purge_effect_cache();
+        assert_eq!(warm, render(&s), "{name}: the group's maps follow its children");
+        prev = warm;
+    }
+}
+
+#[test]
 fn journal_records_mutations_only() {
     let mut s = session_with_doc();
     s.execute("document.inspect", json!({})).unwrap();
