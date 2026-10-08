@@ -920,8 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_set_color_panel_picks_the_edited_chip() {
-    }
+    fn ui_set_color_panel_picks_the_edited_chip() {}
 
     #[test]
     fn ui_set_applies_all_fields_or_none() {
