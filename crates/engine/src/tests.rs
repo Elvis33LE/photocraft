@@ -492,7 +492,8 @@ fn group_effect_maps_follow_child_visibility_and_opacity() {
         photocraft_compose::render(d, d.bounds()).px
     };
     let mut prev = render(&s); // populate the effect-map cache
-    let edits: [(&str, fn(&mut photocraft_doc::Layer)); 2] = [("hide", |l| l.visible = false), ("opacity", |l| l.opacity = 0.3)];
+    type Edit = (&'static str, fn(&mut photocraft_doc::Layer));
+    let edits: [Edit; 2] = [("hide", |l| l.visible = false), ("opacity", |l| l.opacity = 0.3)];
     for ((name, edit), child) in edits.into_iter().zip([a, b]) {
         let child = LayerId(child);
         s.edit(name, |doc, _| {
