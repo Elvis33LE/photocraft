@@ -420,6 +420,55 @@ fn fill_layers_and_colors() {
 }
 
 #[test]
+fn fill_layer_pixel_rewrites_refresh_the_effect_maps() {
+    // A pixel-only rewrite of a fill layer's cache (what Image › Transform and friends do)
+    // leaves the Fill spec alone; the CPU effect maps must follow the cache surface, or the
+    // composite keeps the pre-rewrite drop shadow. Warm render vs. purged render must agree.
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    s.execute("layer.newFillLayer.gradient", json!({"from": "#000000", "to": "#ffffff", "angle": 0})).unwrap();
+    s.edit("shadow", |doc, active| {
+        doc.layer_mut(active.unwrap()).unwrap().effects.items.push(photocraft_doc::Effect::default_drop_shadow());
+        Ok(())
+    })
+    .unwrap();
+    let render = |s: &Session| {
+        let d = &s.active().unwrap().doc;
+        photocraft_compose::render(d, d.bounds()).px
+    };
+    // Give the layer the cached-pixels state a PSD import produces (the cache is what Image
+    // › Transform & friends rewrite in place, without touching the Fill spec).
+    s.edit("cache", |doc, active| {
+        let fmt = doc.pixel_format();
+        let l = doc.layer_mut(active.unwrap()).unwrap();
+        let photocraft_doc::LayerContent::Fill(f) = &l.content else { return Err(EngineError::Other("not a fill layer".into())) };
+        let fill = f.clone();
+        let mut surface = photocraft_raster::Surface::new(fmt);
+        surface.fill_rect(photocraft_geom::Rect::new(8, 8, 30, 40), &[0.0, 0.0, 1.0, 1.0]);
+        l.fill_cache = Some(photocraft_doc::FillCache { fill, surface });
+        Ok(())
+    })
+    .unwrap();
+    let warm = render(&s); // populate the effect-map cache
+    let warm2 = render(&s);
+    assert_eq!(warm, warm2, "a warm cache does not change the composite");
+    // Rewrite the cached pixels in place, without touching the Fill spec.
+    s.edit("shift", |doc, active| {
+        let l = doc.layer_mut(active.unwrap()).unwrap();
+        let fc = l.fill_cache.as_mut().unwrap();
+        let moved = photocraft_algo::resample::translate_surface(&fc.surface, 12, 0);
+        fc.surface = moved;
+        Ok(())
+    })
+    .unwrap();
+    let after = render(&s);
+    assert_ne!(after, warm, "the rewritten cache changes the composite");
+    photocraft_compose::purge_effect_cache();
+    let fresh = render(&s);
+    assert_eq!(after, fresh, "the effect maps track the cache surface, not the Fill spec alone");
+}
+
+#[test]
 fn journal_records_mutations_only() {
     let mut s = session_with_doc();
     s.execute("document.inspect", json!({})).unwrap();
