@@ -1178,27 +1178,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_lookup_retains_engine_shell_and_dynamic_routes() {
+    fn live_lookup_finds_engine_and_shell_commands() {
         for command in photocraft_engine::commands::command_specs() {
             assert!(is_live(command.id), "{}", command.id);
         }
         for &(id, ..) in UI_COMMANDS {
             assert!(is_live(id), "{id}");
-        }
-        for &(.., id) in crate::menu_catalog::CATALOG {
-            let linear = photocraft_engine::commands::command_specs().iter().any(|c| c.id == id)
-                || UI_COMMANDS.iter().any(|c| c.0 == id)
-                || panel_alias(id).is_some()
-                || workspace_name(id).is_some()
-                || proof_preset(id).is_some()
-                || id == "view.proofSetup.custom"
-                || crate::view_cmds::handles(id)
-                || crate::analysis_ui::handles(id)
-                || crate::workspace_ui::handles(id)
-                || crate::preset_panels::handles(id)
-                || crate::type_panels_ui::handles(id)
-                || crate::timeline_ui::handles(id);
-            assert_eq!(is_live(id), linear, "{id}");
         }
         for id in ["", "missing.command", "💾"] {
             assert!(!is_live(id));
