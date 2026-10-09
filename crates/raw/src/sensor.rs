@@ -227,20 +227,21 @@ pub(crate) fn read_plane(t: &Tiff, ifd: &Ifd, limits: &Limits, layout: JpegLayou
         match compression {
             1 => unpack(src, s.w, rows, samples, bits, le),
             8 => {
-                // Adobe DNG compression 8: zlib streams (RFC 1950). The decompressed size is
-                // known from the geometry, so a bomb cannot grow past the tile.
-                let need = s.w * rows * samples * (bits as usize).div_ceil(8);
+                // Adobe DNG compression 8: zlib streams (RFC 1950). The output is capped at the
+                // tile's size in whole bytes per sample, so a bomb cannot grow past the tile;
+                // `unpack` then reads it bit-packed or in 16-bit containers by its length.
+                let too_big = || RawError::malformed("deflate tile is too large");
+                let need =
+                    s.w.checked_mul(rows).and_then(|n| n.checked_mul(samples)).and_then(|n| n.checked_mul((bits as usize).div_ceil(8))).ok_or_else(too_big)?;
                 let mut out = vec![0u8; need];
                 let mut d = flate2::Decompress::new(true);
                 d.decompress(src, &mut out, flate2::FlushDecompress::Finish).map_err(|_| RawError::malformed("deflate tile does not decompress"))?;
-                if d.total_out() as usize != need {
-                    return Err(RawError::malformed("deflate tile decompresses to the wrong size"));
-                }
+                out.truncate(usize::try_from(d.total_out()).unwrap_or(need).min(need));
                 let v = unpack(&out, s.w, rows, samples, bits, le)?;
                 // The TIFF predictor runs after unpacking, per row, per sample plane.
                 match t.tag_uint(ifd, tag::PREDICTOR).unwrap_or(1) {
                     1 => Ok(v),
-                    2 => Ok(undelta(&v, samples, s.w * samples, rows.min(s.h))),
+                    2 => Ok(undelta(&v, samples, s.w * samples, rows, bits)),
                     3 => Err(RawError::unsupported("floating-point predictor (compression 8, predictor 3)")),
                     p => Err(RawError::malformed(format!("unknown predictor {p}"))),
                 }
@@ -324,24 +325,25 @@ pub(crate) fn segments(t: &Tiff, ifd: &Ifd, width: usize, height: usize) -> Resu
     Ok(out)
 }
 
-/// Unpacks uncompressed samples: 8-bit, 16-bit in the file's byte order, or
-/// MSB-first bit-packed rows padded to a byte (TIFF 6.0). 9–15-bit data
-/// stored in 16-bit containers (common in camera raws) is recognised by its
-/// byte count.
 /// Reverses TIFF predictor 2 (horizontal differencing) on interleaved samples: each sample
-/// gains the sum of its channel's predecessors in the row, wrapping at 16 bits.
-fn undelta(v: &[u16], plane: usize, row_samples: usize, rows: usize) -> Vec<u16> {
+/// gains its channel's predecessor in the row, wrapping at the sample's container (8 or 16 bits).
+fn undelta(v: &[u16], plane: usize, row_samples: usize, rows: usize, bits: u32) -> Vec<u16> {
+    let mask: u16 = if bits <= 8 { 0xFF } else { 0xFFFF };
     let mut out = v.to_vec();
-    for r in 0..rows {
-        let (start, end) = (r * row_samples, (r + 1) * row_samples);
-        for i in start..end {
-            let prev = if i >= start + plane { out[i - plane] } else { 0 };
-            out[i] = out[i].wrapping_add(prev);
+    for row in out.chunks_mut(row_samples.max(1)).take(rows) {
+        for i in plane..row.len() {
+            if let (Some(&prev), Some(&cur)) = (row.get(i - plane), row.get(i)) {
+                row[i] = cur.wrapping_add(prev) & mask;
+            }
         }
     }
     out
 }
 
+/// Unpacks uncompressed samples: 8-bit, 16-bit in the file's byte order, or
+/// MSB-first bit-packed rows padded to a byte (TIFF 6.0). 9–15-bit data
+/// stored in 16-bit containers (common in camera raws) is recognised by its
+/// byte count.
 fn unpack(src: &[u8], w: usize, rows: usize, samples: usize, bits: u32, le: bool) -> Result<Vec<u16>> {
     let n = w * rows * samples;
     let truncated = || RawError::malformed("uncompressed raw data is truncated");
