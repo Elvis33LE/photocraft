@@ -1097,7 +1097,7 @@ fn gpu_budget(app: &mut PhotocraftApp, gpu: &crate::gpu_canvas::GpuCanvas, idx: 
 }
 
 /// Live preview for an open filter dialog: run the filter on the proxy and upload it.
-fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize) -> Option<(u32, u64, [u32; 2])> {
+fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize, ctx: &egui::Context) -> Option<(u32, u64, [u32; 2])> {
     if crate::adjust_preview::on_layer(app, idx) {
         return None;
     }
@@ -1108,29 +1108,96 @@ fn ensure_filter_preview(app: &mut PhotocraftApp, idx: usize) -> Option<(u32, u6
     let cmd = d.fields.get("__command")?.as_str()?.to_string();
     // Previews edit what the command will: a targeted layer mask included (#780).
     let params = app.with_mask_target(&cmd, crate::filter_dialog::params_of(&d.fields));
-    let (doc_id, revision, doc, active) = {
-        let st = app.session.documents().get(idx)?;
-        (st.doc.id, st.revision, st.doc.clone(), st.active_layer)
+    let st = app.session.documents().get(idx)?;
+    let request = crate::filter_dialog::FilterPreviewKey {
+        doc: st.doc.id,
+        revision: st.revision,
+        dialog: d.id,
+        active: st.active_layer,
+        command: cmd,
+        params,
+        k: crate::proxy::preview_factor(&st.doc, crate::proxy::reduced_previews(app)),
     };
-    let k = crate::proxy::preview_factor(&doc, crate::proxy::reduced_previews(app));
-    let hash = format!("{cmd}{params}").bytes().fold(k as u64 ^ revision.wrapping_mul(0x9e37), |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
-    let key = doc_id.0 ^ (1u64 << 61);
-    let fresh = matches!(&app.filter_preview, Some(p) if p.doc == doc_id && p.hash == hash);
-    if !fresh {
-        let t0 = crate::gpu_canvas::now_ms();
-        let result = crate::filter_dialog::preview_document(&doc, active, &cmd, &params, k).map(std::sync::Arc::new);
-        if let Some(r) = &result {
-            let buf = photocraft_compose::flatten(r);
-            let t1 = crate::gpu_canvas::now_ms();
-            let (display, _) = canvas_display(app, &doc, None);
-            app.gpu.as_ref()?.upload_buffer_full(key, &texture_buffer(display.as_deref(), &buf), doc.depth);
-            app.perf.record("filter-preview", r.size.area(), t1 - t0, crate::gpu_canvas::now_ms() - t1);
+    let key = request.doc.0 ^ (1u64 << 61);
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.background_jobs && request.command == "image.mode.indexedColor" {
+        if let Some((finished, computed)) = app.filter_preview_worker.poll()
+            && finished == request
+        {
+            match computed {
+                Ok(computed) => publish_filter_preview(app, idx, finished, computed.result, computed.ms),
+                Err(error) => {
+                    app.filter_preview = Some(crate::filter_dialog::FilterPreview { key: finished, result: None });
+                    crate::notices::error(app, error);
+                }
+            }
         }
-        app.filter_preview = Some(crate::filter_dialog::FilterPreview { doc: doc_id, revision, hash, k, result });
+        let fresh = app.filter_preview.as_ref().is_some_and(|p| p.key == request);
+        if !fresh && !app.filter_preview_worker.busy() {
+            let doc = app.session.documents().get(idx)?.doc.clone();
+            let task = request.clone();
+            if let Err(error) = app.filter_preview_worker.start(request.clone(), ctx.clone(), move || {
+                let t0 = crate::gpu_canvas::now_ms();
+                let result = crate::filter_dialog::preview_document(&doc, task.active, &task.command, &task.params, task.k).map(|doc| {
+                    let buffer = photocraft_compose::flatten(&doc);
+                    (std::sync::Arc::new(doc), buffer)
+                });
+                crate::filter_preview_worker::Computed { result, ms: crate::gpu_canvas::now_ms() - t0 }
+            }) {
+                app.filter_preview = Some(crate::filter_dialog::FilterPreview { key: request.clone(), result: None });
+                crate::notices::error(app, error);
+            }
+        }
+        if app.filter_preview_worker.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        let preview = app.filter_preview.as_ref()?;
+        // Keep the last preview during a drag, but never one from another source or dialog.
+        // Completed worker results above must match every parameter before being uploaded.
+        if preview.key.doc != request.doc
+            || preview.key.revision != request.revision
+            || preview.key.dialog != request.dialog
+            || preview.key.active != request.active
+            || preview.key.k != request.k
+            || preview.key.command != request.command
+        {
+            return None;
+        }
+        let result = preview.result.as_ref()?;
+        return Some((preview.key.k, key, [result.size.width, result.size.height]));
+    }
+    // Web and explicitly inline sessions keep the deterministic synchronous path.
+    let _ = ctx;
+    if app.filter_preview.as_ref().is_none_or(|p| p.key != request) {
+        let t0 = crate::gpu_canvas::now_ms();
+        let doc = app.session.documents().get(idx)?.doc.clone();
+        let result = crate::filter_dialog::preview_document(&doc, request.active, &request.command, &request.params, request.k).map(|doc| {
+            let buffer = photocraft_compose::flatten(&doc);
+            (std::sync::Arc::new(doc), buffer)
+        });
+        publish_filter_preview(app, idx, request, result, crate::gpu_canvas::now_ms() - t0);
     }
     let preview = app.filter_preview.as_ref()?;
     let result = preview.result.as_ref()?;
-    Some((preview.k, key, [result.size.width, result.size.height]))
+    Some((preview.key.k, key, [result.size.width, result.size.height]))
+}
+
+fn publish_filter_preview(
+    app: &mut PhotocraftApp,
+    idx: usize,
+    request: crate::filter_dialog::FilterPreviewKey,
+    computed: Option<(std::sync::Arc<photocraft_doc::Document>, photocraft_compose::Buffer)>,
+    ms: f64,
+) {
+    let result = computed.and_then(|(result, buffer)| {
+        let t0 = crate::gpu_canvas::now_ms();
+        let doc = app.session.documents().get(idx)?.doc.clone();
+        let (display, _) = canvas_display(app, &doc, None);
+        app.gpu.as_ref()?.upload_buffer_full(request.doc.0 ^ (1u64 << 61), &texture_buffer(display.as_deref(), &buffer), doc.depth);
+        app.perf.record("filter-preview", result.size.area(), ms, crate::gpu_canvas::now_ms() - t0);
+        Some(result)
+    });
+    app.filter_preview = Some(crate::filter_dialog::FilterPreview { key: request, result });
 }
 
 /// The document pixels a view shows, with a margin for filtering. Uses all four canvas corners
@@ -1234,7 +1301,7 @@ pub(crate) fn retain_gpu_documents(app: &mut PhotocraftApp) {
     // Upload markers must not outlive the resources they describe: native reopen can reuse
     // both the document ID and revision before the next frame while a preview dialog stays open.
     let documents = app.session.documents();
-    if app.filter_preview.as_ref().is_some_and(|preview| !documents.iter().any(|st| st.doc.id == preview.doc)) {
+    if app.filter_preview.as_ref().is_some_and(|preview| !documents.iter().any(|st| st.doc.id == preview.key.doc)) {
         app.filter_preview = None;
     }
     if app.proxy_uploaded.is_some_and(|(doc, _)| !documents.iter().any(|st| st.doc.id == doc)) {
@@ -1967,7 +2034,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
     if app.gpu.is_some()
         && gpu_ok
         && let Some((k, key, preview_size)) = ensure_adjust_proxy(app, idx, view.zoom * ctx.pixels_per_point())
-            .or_else(|| ensure_filter_preview(app, idx))
+            .or_else(|| ensure_filter_preview(app, idx, &ctx))
             .or_else(|| ensure_proxy_preview(app, idx))
     {
         on_gpu = true;
@@ -3781,6 +3848,56 @@ mod tabs_tests;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn indexed_preview_discards_a_finished_job_after_slider_change_or_reopening() {
+        for reopen in [false, true] {
+            let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+            app.run("file.new", json!({"width": 8, "height": 8})).unwrap();
+            app.background_jobs = true;
+            crate::filter_dialog::open(&mut app, "image.mode.indexedColor").unwrap();
+            let d = app.ui.dialogs.first().unwrap();
+            let st = app.session.active().unwrap();
+            let old = crate::filter_dialog::FilterPreviewKey {
+                doc: st.doc.id,
+                revision: st.revision,
+                dialog: d.id,
+                active: st.active_layer,
+                command: "image.mode.indexedColor".into(),
+                params: app.with_mask_target("image.mode.indexedColor", crate::filter_dialog::params_of(&d.fields)),
+                k: 1,
+            };
+            let (release, wait) = std::sync::mpsc::channel();
+            let ctx = egui::Context::default();
+            app.filter_preview_worker
+                .start(old.clone(), ctx.clone(), move || {
+                    wait.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                    crate::filter_preview_worker::Computed { result: None, ms: 0.0 }
+                })
+                .unwrap();
+            if reopen {
+                app.ui.dialogs.clear();
+                crate::filter_preview_worker::discard_closed(&mut app);
+                crate::filter_dialog::open(&mut app, "image.mode.indexedColor").unwrap();
+            } else {
+                app.ui.dialogs.first_mut().unwrap().fields.insert("colors".into(), json!(16));
+            }
+            assert!(ensure_filter_preview(&mut app, 0, &ctx).is_none());
+            assert!(app.filter_preview.is_none());
+            release.send(()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.filter_preview.is_none() {
+                assert!(std::time::Instant::now() < deadline);
+                ensure_filter_preview(&mut app, 0, &ctx);
+                if let Some(preview) = &app.filter_preview {
+                    assert_ne!(preview.key, old, "an outdated preview was published");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(app.session.active().unwrap().doc.mode, photocraft_color::ColorMode::Rgb);
+        }
+    }
+
     #[test]
     fn windows_uses_a_visible_crosshair() {
         // #737: Windows' inverting crosshair vanishes over mid-grey; use a black/white glyph.
