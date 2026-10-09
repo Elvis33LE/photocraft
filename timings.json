@@ -1,0 +1,139 @@
+{
+  "date": "2026-10-09",
+  "hardware": "AMD Ryzen AI 7 350, Windows",
+  "source_pixels": 4194304,
+  "source_depth": "opaque RGB8",
+  "palette": "Selective + Black/White",
+  "dither": "Floyd-Steinberg 75%",
+  "factor": 1,
+  "samples": "one warmup, three measured; p50",
+  "profile": {
+    "lto": false,
+    "codegen_units": 16
+  },
+  "scope": "complete CPU preview; excludes GPU upload/presentation",
+  "avatar_pair": [
+    {
+      "colors": 8,
+      "exact": true,
+      "palette_ms": {
+        "before": 238.9772,
+        "after": 166.3968,
+        "speedup": 1.4361886767053211
+      },
+      "diffusion_ms": {
+        "before": 151.94050000000001,
+        "after": 75.6553,
+        "speedup": 2.0083259203254764
+      },
+      "preview_ms": {
+        "before": 932.3012000000001,
+        "after": 384.4545,
+        "speedup": 2.4249974964527663
+      }
+    },
+    {
+      "colors": 16,
+      "exact": true,
+      "palette_ms": {
+        "before": 304.1019,
+        "after": 269.30929999999995,
+        "speedup": 1.1291919736897318
+      },
+      "diffusion_ms": {
+        "before": 198.5114,
+        "after": 143.48659999999998,
+        "speedup": 1.3834838932694762
+      },
+      "preview_ms": {
+        "before": 1056.2573,
+        "after": 598.5074000000001,
+        "speedup": 1.7648191150184607
+      }
+    },
+    {
+      "colors": 32,
+      "exact": true,
+      "palette_ms": {
+        "before": 347.5416,
+        "after": 322.89889999999997,
+        "speedup": 1.0763170763356582
+      },
+      "diffusion_ms": {
+        "before": 288.01959999999997,
+        "after": 197.0288,
+        "speedup": 1.461814719472483
+      },
+      "preview_ms": {
+        "before": 1144.9574,
+        "after": 697.3912,
+        "speedup": 1.6417720785693883
+      }
+    },
+    {
+      "colors": 64,
+      "exact": true,
+      "palette_ms": {
+        "before": 444.7747,
+        "after": 415.02430000000004,
+        "speedup": 1.0716835134713798
+      },
+      "diffusion_ms": {
+        "before": 463.0011,
+        "after": 315.19039999999995,
+        "speedup": 1.4689568590921553
+      },
+      "preview_ms": {
+        "before": 1418.6836999999998,
+        "after": 903.0195,
+        "speedup": 1.5710443683663529
+      }
+    },
+    {
+      "colors": 128,
+      "exact": true,
+      "palette_ms": {
+        "before": 601.3407,
+        "after": 469.2706,
+        "speedup": 1.2814369790052902
+      },
+      "diffusion_ms": {
+        "before": 835.5728,
+        "after": 294.1304,
+        "speedup": 2.8408243418565373
+      },
+      "preview_ms": {
+        "before": 1930.2148,
+        "after": 924.1247000000001,
+        "speedup": 2.088695172848426
+      }
+    },
+    {
+      "colors": 256,
+      "exact": true,
+      "palette_ms": {
+        "before": 912.3444000000001,
+        "after": 606.1188,
+        "speedup": 1.5052237284175976
+      },
+      "diffusion_ms": {
+        "before": 1570.1182000000001,
+        "after": 298.5108,
+        "speedup": 5.259837165020495
+      },
+      "preview_ms": {
+        "before": 3017.8284,
+        "after": 1060.7494,
+        "speedup": 2.844996565635578
+      }
+    }
+  ],
+  "synthetic_24mp_lookup": {
+    "pixels": 24000000,
+    "palette_entries": 216,
+    "linear_p50_ms": 5160.9244,
+    "accelerated_p50_ms": 1297.9751,
+    "exact_pixels_and_indices": true,
+    "condition": "no parallel builds"
+  }
+}
