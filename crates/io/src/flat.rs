@@ -101,7 +101,7 @@ pub(crate) fn image_to_document(name: &str, img: &Image) -> Result<ImportResult,
         doc.resolution_dpi = x;
         warnings.extend(crate::unequal_resolution_warning(f64::from(x), f64::from(y)));
     }
-    Ok(ImportResult { document: doc, warnings })
+    Ok(ImportResult { document: doc, warnings, source_read_only: false, preview_only: false })
 }
 
 /// `Some(surface)` when the document is exactly one visible, unmasked,
