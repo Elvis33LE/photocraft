@@ -1285,11 +1285,6 @@ pub(crate) fn layer_copy(doc: &Document, id: LayerId) -> Result<Layer> {
     Ok(dup)
 }
 
-/// Does `l` (or any descendant) have id `target`?
-fn contains_layer(l: &Layer, target: LayerId) -> bool {
-    l.id == target || l.children().is_some_and(|c| c.iter().any(|c| contains_layer(c, target)))
-}
-
 #[cfg(test)]
 mod registry_tests {
     use super::*;
