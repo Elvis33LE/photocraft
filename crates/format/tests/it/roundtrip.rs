@@ -1009,7 +1009,7 @@ fn decreasing_deep_counts_are_refused_at_load() {
     if let Some(LayerContent::Deep(d)) = hostile.layers.first_mut().map(|l| &mut l.content) {
         d.counts = vec![0, 2, 1];
         for c in &mut d.channels {
-            c.samples = vec![1.0, 1.0]; // total == 2 stays consistent with the channel length
+            c.samples = vec![1.0, 1.0]; // total == 2 keeps the length check happy
         }
     }
     let bytes = save_to_bytes(&hostile, &SaveOptions::default()).unwrap();
