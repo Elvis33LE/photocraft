@@ -37,11 +37,17 @@ fn map_exr(e: exr::error::Error) -> CodecError {
 /// after checking every part's declared size against the limits, before any pixel allocation.
 fn read_meta(bytes: &[u8], limits: &Limits) -> Result<MetaData, CodecError> {
     let meta = MetaData::read_from_buffered(Cursor::new(bytes), false).map_err(err)?;
+    // Flat decoding reads every part at once, so the parts' sizes are also capped together.
+    let mut total: u64 = 0;
     for header in meta.headers.iter() {
         let size = header.layer_size;
         let (w, h) = (u32::try_from(size.0).unwrap_or(u32::MAX), u32::try_from(size.1).unwrap_or(u32::MAX));
         let bpp = header.channels.list.len().max(1) as u64 * 4;
         limits.check_bytes(w, h, bpp)?;
+        total = total.saturating_add(u64::from(w).saturating_mul(u64::from(h)).saturating_mul(bpp));
+    }
+    if total > limits.max_alloc {
+        return Err(CodecError::LimitExceeded(format!("{total} bytes across {} parts exceed max_alloc {}", meta.headers.len(), limits.max_alloc)));
     }
     Ok(meta)
 }
@@ -92,7 +98,7 @@ fn pick_part(meta: &MetaData) -> usize {
 fn read_layer(bytes: &[u8], index: usize) -> Result<Layer<AnyChannels<FlatSamples>>, CodecError> {
     let image =
         read().no_deep_data().largest_resolution_level().all_channels().all_layers().all_attributes().from_buffered(Cursor::new(bytes)).map_err(map_exr)?;
-    image.layer_data.get(index).cloned().ok_or_else(|| err(format!("part {index} is missing from the file")))
+    image.layer_data.into_iter().nth(index).ok_or_else(|| err(format!("part {index} is missing from the file")))
 }
 
 fn layer_to_image(layer: &Layer<AnyChannels<FlatSamples>>) -> Result<Image, CodecError> {

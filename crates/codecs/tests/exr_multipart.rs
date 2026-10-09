@@ -189,3 +189,11 @@ fn truncated_files_error_never_panic() {
         let _ = decode_exr_part(cut, 1, &DecodeOptions::default());
     }
 }
+
+#[test]
+fn parts_are_capped_together() {
+    // Each part fits alone (largest 256 bytes) but the three together (512) do not.
+    let limits = Limits { max_alloc: 300, ..Limits::default() };
+    let e = exr_info(&aov_file(), &limits).unwrap_err().to_string();
+    assert!(e.contains("across 3 parts"), "{e}");
+}
