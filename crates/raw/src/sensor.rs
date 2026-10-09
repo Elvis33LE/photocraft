@@ -209,8 +209,7 @@ pub(crate) fn read_plane(t: &Tiff, ifd: &Ifd, limits: &Limits, layout: JpegLayou
         return Err(RawError::unsupported("planar raw data"));
     }
     match compression {
-        1 | 7 => {}
-        8 => return Err(RawError::unsupported("Deflate-compressed (floating-point) DNG")),
+        1 | 7 | 8 => {}
         34892 => return Err(RawError::unsupported("lossy-compressed DNG")),
         52546 => return Err(RawError::unsupported("JPEG XL-compressed DNG")),
         34713 => return Err(RawError::unsupported("Nikon compressed NEF")),
@@ -227,6 +226,25 @@ pub(crate) fn read_plane(t: &Tiff, ifd: &Ifd, limits: &Limits, layout: JpegLayou
         let src = t.bytes(s.offset, s.len).ok_or_else(|| RawError::malformed("raw data lies outside the file"))?;
         match compression {
             1 => unpack(src, s.w, rows, samples, bits, le),
+            8 => {
+                // Adobe DNG compression 8: zlib streams (RFC 1950). The decompressed size is
+                // known from the geometry, so a bomb cannot grow past the tile.
+                let need = s.w * rows * samples * (bits as usize).div_ceil(8);
+                let mut out = vec![0u8; need];
+                let mut d = flate2::Decompress::new(true);
+                d.decompress(src, &mut out, flate2::FlushDecompress::Finish).map_err(|_| RawError::malformed("deflate tile does not decompress"))?;
+                if d.total_out() as usize != need {
+                    return Err(RawError::malformed("deflate tile decompresses to the wrong size"));
+                }
+                let v = unpack(&out, s.w, rows, samples, bits, le)?;
+                // The TIFF predictor runs after unpacking, per row, per sample plane.
+                match t.tag_uint(ifd, tag::PREDICTOR).unwrap_or(1) {
+                    1 => Ok(v),
+                    2 => Ok(undelta(&v, samples, s.w * samples, rows.min(s.h))),
+                    3 => Err(RawError::unsupported("floating-point predictor (compression 8, predictor 3)")),
+                    p => Err(RawError::malformed(format!("unknown predictor {p}"))),
+                }
+            }
             _ => {
                 let need = s.w * rows * samples;
                 let max = s.w.saturating_mul(s.h).saturating_mul(samples).saturating_mul(4);
@@ -310,6 +328,20 @@ pub(crate) fn segments(t: &Tiff, ifd: &Ifd, width: usize, height: usize) -> Resu
 /// MSB-first bit-packed rows padded to a byte (TIFF 6.0). 9–15-bit data
 /// stored in 16-bit containers (common in camera raws) is recognised by its
 /// byte count.
+/// Reverses TIFF predictor 2 (horizontal differencing) on interleaved samples: each sample
+/// gains the sum of its channel's predecessors in the row, wrapping at 16 bits.
+fn undelta(v: &[u16], plane: usize, row_samples: usize, rows: usize) -> Vec<u16> {
+    let mut out = v.to_vec();
+    for r in 0..rows {
+        let (start, end) = (r * row_samples, (r + 1) * row_samples);
+        for i in start..end {
+            let prev = if i >= start + plane { out[i - plane] } else { 0 };
+            out[i] = out[i].wrapping_add(prev);
+        }
+    }
+    out
+}
+
 fn unpack(src: &[u8], w: usize, rows: usize, samples: usize, bits: u32, le: bool) -> Result<Vec<u16>> {
     let n = w * rows * samples;
     let truncated = || RawError::malformed("uncompressed raw data is truncated");

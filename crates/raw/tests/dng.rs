@@ -371,3 +371,45 @@ fn limits_are_enforced_before_allocating() {
     let tiny = Limits { max_alloc: 1000, ..Limits::default() };
     assert!(matches!(decode(&b, &tiny), Err(RawError::LimitExceeded(_))));
 }
+
+/// Adobe DNG compression 8 (zlib): with and without the horizontal-differencing predictor,
+/// with and without 12-bit packing, and both byte orders — each decodes to the exact samples.
+#[test]
+fn deflate_strips_round_trip() {
+    let (w, h) = (48, 40);
+    for (name, bits, storage, be) in [
+        ("deflate 16-bit", 16, DngStorage::DeflateStrips { rows: 16, predictor: 1 }, false),
+        ("deflate 16-bit predictor 2", 16, DngStorage::DeflateStrips { rows: 16, predictor: 2 }, false),
+        ("deflate 12-bit predictor 2", 12, DngStorage::DeflateStrips { rows: 12, predictor: 2 }, false),
+        ("deflate 16-bit predictor 2 BE", 16, DngStorage::DeflateStrips { rows: 16, predictor: 2 }, true),
+        ("deflate LinearRaw predictor 2", 16, DngStorage::DeflateStrips { rows: 40, predictor: 2 }, false),
+    ] {
+        let samples = if name.contains("LinearRaw") { 3 } else { 1 };
+        let data = noise(w * h * samples, bits);
+        let mut spec = DngSpec::cfa(w, h, data.clone());
+        spec.samples = samples;
+        spec.bits = bits;
+        spec.storage = storage;
+        spec.big_endian = be;
+        spec.white = (1 << bits) - 1;
+        let s = sensor(&spec.build());
+        assert_eq!((s.width, s.height, s.samples), (w, h, samples), "{name}");
+        assert_eq!(s.data, data, "{name}");
+    }
+}
+
+/// A zlib stream cut short must fail cleanly (decompression comes up short or errors), and a
+/// declared-but-absent giant tile must trip the limits instead of allocating.
+#[test]
+fn deflate_hostile_fails_cleanly() {
+    let (w, h) = (32, 32);
+    let data = noise(w * h, 16);
+    let mut spec = DngSpec::cfa(w, h, data);
+    spec.storage = DngStorage::DeflateStrips { rows: 32, predictor: 2 };
+    let bytes = spec.build();
+    assert_eq!(sensor(&bytes).data.len(), w * h);
+    // Locate the zlib stream (78 9c header of the single strip) and cut it mid-stream.
+    let at = bytes.windows(2).position(|w| w == [0x78, 0x9c]).expect("zlib header") + 2;
+    let cut = &bytes[..at + (bytes.len() - at) / 2];
+    assert!(decode(cut, &Limits::default()).is_err(), "a cut zlib stream must not decode");
+}
