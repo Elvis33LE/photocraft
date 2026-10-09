@@ -18,6 +18,8 @@
 # contributors.py run, and the next build, drop them.
 
 [people.Elvis33LE]
+
+[people.AlanRockefeller]
 sync_github_name = true
 
 [people.echelon]
