@@ -684,6 +684,8 @@ mod tests {
         assert_eq!(tr_ctx(de, "layerLabel", "No Color"), "Keine Farbe");
         assert_eq!(tr_ctx(de, "layerLabel", "Seafoam"), "Meeresschaum");
         assert_eq!(tr(Lang::EN, "Seafoam"), "Seafoam");
+    }
+
     /// Font style labels are built from dynamic words (weights, "Italic"), so the literal
     /// scanner cannot cover them; "Light" there is a weight, distinct from the Camera Raw
     /// "Light" section (`type_tool::style_label`).
