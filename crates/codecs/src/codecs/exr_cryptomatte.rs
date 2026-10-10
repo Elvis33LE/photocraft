@@ -208,7 +208,11 @@ pub(crate) fn decode(bytes: &[u8], layer_name: &str, limits: &Limits) -> Result<
     let size = header.layer_size;
     let (w, h) = (size.0, size.1);
     let npx = w.checked_mul(h).ok_or_else(|| CodecError::malformed(F, "the layer is too large"))?;
-    limits.check_bytes(w as u32, h as u32, layer.channels.len().max(1) as u64 * 8)?;
+    let too_large = || CodecError::malformed(F, "the layer is too large");
+    let (w32, h32) = (u32::try_from(w).map_err(|_| too_large())?, u32::try_from(h).map_err(|_| too_large())?);
+    // Each pixel also gets a pair list, so count its header with the channel samples.
+    let per_pixel = (layer.channels.len().max(1) as u64).saturating_mul(8).saturating_add(std::mem::size_of::<Vec<(f32, f32)>>() as u64);
+    limits.check_bytes(w32, h32, per_pixel)?;
 
     let image = read().no_deep_data().largest_resolution_level().all_channels().all_layers().all_attributes().from_buffered(Cursor::new(bytes)).map_err(
         |e| match e {
@@ -241,5 +245,5 @@ pub(crate) fn decode(bytes: &[u8], layer_name: &str, limits: &Limits) -> Result<
         }
         out.sort_by(|a, b| b.1.total_cmp(&a.1));
     }
-    Ok(CryptomatteBuffer { width: w as u32, height: h as u32, pixels })
+    Ok(CryptomatteBuffer { width: w32, height: h32, pixels })
 }
