@@ -890,7 +890,16 @@ fn shapeless_stroke_bounds(layer: &Layer) -> Option<Rect> {
     }
 
     match &layer.content {
-        LayerContent::Raster(_) | LayerContent::Text(_) | LayerContent::Shape(_) | LayerContent::Smart(_) => layer.surface().map(bounds::content_bounds),
+        LayerContent::Raster(_) | LayerContent::Text(_) | LayerContent::Shape(_) | LayerContent::Smart(_) => {
+            let b = layer.surface().map_or(Rect::EMPTY, bounds::content_bounds);
+            // A filled shape's effects follow its outline, also where its fill is transparent (as
+            // in `layer_bounds`).
+            Some(match effect_outline(layer).and_then(|_| paint_bounds(layer)) {
+                Some(p) if !b.is_empty() => b.union(&p),
+                Some(p) => p,
+                None => b,
+            })
+        }
         _ => None,
     }
 }
@@ -1147,9 +1156,10 @@ fn composite_artboard(layer: &Layer, ab: &photocraft_doc::Artboard, clipped: &[L
 
 fn composite_layer_plain(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer, cx: &Ctx, scope: advanced::Scope) {
     let rect = backdrop.rect;
-    // A base that is transparent here can still have visible clipped siblings; keep the full
-    // clipping path in that case instead of using the layer-only bounds shortcut.
-    if clipped.is_empty() && empty_in(layer, rect) {
+    // A TSL-off stroke base that is transparent here can still have visible clipped siblings;
+    // keep the full clipping path for it instead of the stroke-bounds shortcut. Other bases keep
+    // the usual skip (their clipped layers vanish with them).
+    if (clipped.is_empty() || shapeless_stroke_bounds(layer).is_none()) && empty_in(layer, rect) {
         return;
     }
     let opacity = layer.opacity * layer.fill_opacity;
