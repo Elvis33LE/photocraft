@@ -136,11 +136,6 @@ pub fn warp_surface(src: &Surface, src_rect: Rect, h: &Homography, interp: Inter
         converted = src.try_convert(fmt)?;
         &converted
     };
-    let source_pixels = (src_rect.width() as usize).checked_mul(src_rect.height() as usize).ok_or(photocraft_raster::AllocationError::SizeOverflow)?;
-    const MAX_WARP_PIXELS: usize = 400_000_000;
-    if source_pixels > MAX_WARP_PIXELS {
-        return Err(photocraft_raster::AllocationError::NotEnoughMemory { bytes: source_pixels.saturating_mul(fmt.bytes_per_pixel()) });
-    }
     let mut out = Surface::new(fmt);
     if src_rect.is_empty() {
         return Ok(out);
@@ -171,10 +166,6 @@ pub fn warp_surface(src: &Surface, src_rect: Rect, h: &Homography, interp: Inter
     let bx1 = corners.iter().map(|c| c.0).fold(f64::MIN, f64::max).ceil().min(lim as f64) as i32 + 1;
     let by1 = corners.iter().map(|c| c.1).fold(f64::MIN, f64::max).ceil().min(lim as f64) as i32 + 1;
     let dst = Rect::new(bx0, by0, bx1, by1);
-    let dst_pixels = (dst.width() as usize).checked_mul(dst.height() as usize).ok_or(photocraft_raster::AllocationError::SizeOverflow)?;
-    if dst_pixels > MAX_WARP_PIXELS {
-        return Err(photocraft_raster::AllocationError::NotEnoughMemory { bytes: dst_pixels.saturating_mul(fmt.bytes_per_pixel()) });
-    }
     let n = fmt.channels();
     let a = n - 1;
     let tile_count = dst.tiles().count();
