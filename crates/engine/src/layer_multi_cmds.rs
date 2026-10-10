@@ -1137,7 +1137,16 @@ fn merge_layers(s: &mut Session) -> Result<Value> {
             return Err(EngineError::Other("the selected layers are all hidden".into()));
         }
         if solo.layers.iter().all(|l| matches!(l.content, LayerContent::Deep(_))) {
-            // A deep selection merges its samples and stays deep (Nuke's DeepMerge).
+            // A deep selection merges its samples and stays deep (Nuke's DeepMerge); the
+            // upper layers must composite as-is (see `pixels::deep_merge_blocker`).
+            for l in solo.layers.iter().skip(1) {
+                if let Some(what) = crate::pixels::deep_merge_blocker(l) {
+                    return Err(EngineError::Other(format!(
+                        "layer \"{}\" has {what}; sample merging would drop it. Flatten or rasterize the layer to bake it in first",
+                        l.name
+                    )));
+                }
+            }
             let mut data: Option<photocraft_doc::DeepData> = None;
             for l in &solo.layers {
                 if let LayerContent::Deep(d) = &l.content
@@ -1168,7 +1177,8 @@ fn merge_layers(s: &mut Session) -> Result<Value> {
             *active = Some(mid);
             return Ok(mid);
         }
-        let buf = photocraft_compose::flatten(&solo);        let fmt = doc.pixel_format();
+        let buf = photocraft_compose::flatten(&solo);
+        let fmt = doc.pixel_format();
         let fmt = PixelFormat::new(fmt.mode, fmt.sample, true);
         let mut merged = Layer::raster(top.name.clone(), fmt);
         merged.locks = top.locks;
