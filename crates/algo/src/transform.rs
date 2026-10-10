@@ -126,19 +126,24 @@ fn catmull_rom(t: f64) -> [f64; 4] {
 /// Warp `src` (its content inside `src_rect`) by `h` (source → destination document space).
 /// The result has the same format as `src`, with alpha added if `src` had none; pixels outside
 /// the warped quad are transparent.
-pub fn warp_surface(src: &Surface, src_rect: Rect, h: &Homography, interp: Interp) -> Surface {
+pub fn warp_surface(src: &Surface, src_rect: Rect, h: &Homography, interp: Interp) -> Result<Surface, photocraft_raster::AllocationError> {
     let mut fmt = src.format();
     let converted;
     let mut src = if fmt.alpha {
         src
     } else {
         fmt = PixelFormat::new(fmt.mode, fmt.sample, true);
-        converted = src.convert(fmt);
+        converted = src.try_convert(fmt)?;
         &converted
     };
+    let source_pixels = (src_rect.width() as usize).checked_mul(src_rect.height() as usize).ok_or(photocraft_raster::AllocationError::SizeOverflow)?;
+    const MAX_WARP_PIXELS: usize = 400_000_000;
+    if source_pixels > MAX_WARP_PIXELS {
+        return Err(photocraft_raster::AllocationError::NotEnoughMemory { bytes: source_pixels.saturating_mul(fmt.bytes_per_pixel()) });
+    }
     let mut out = Surface::new(fmt);
     if src_rect.is_empty() {
-        return out;
+        return Ok(out);
     }
     let mut h = *h;
     let mut src_rect = src_rect;
@@ -153,12 +158,12 @@ pub fn warp_surface(src: &Surface, src_rect: Rect, h: &Homography, interp: Inter
         h = h.mul(&Homography([1.0 / f, 0.0, 0.0, 0.0, 1.0 / f, 0.0, 0.0, 0.0, 1.0]));
         src_rect = crate::resample::scaled_rect(src_rect, f, f);
     }
-    let Some(inv) = h.inverse() else { return out };
+    let Some(inv) = h.inverse() else { return Ok(out) };
     // Destination bounds: the warped corners (plus a pixel for filter support).
     let corners = [(src_rect.x0, src_rect.y0), (src_rect.x1, src_rect.y0), (src_rect.x1, src_rect.y1), (src_rect.x0, src_rect.y1)]
         .map(|(x, y)| h.apply(x as f64, y as f64));
     if corners.iter().any(|c| !c.0.is_finite() || !c.1.is_finite()) {
-        return out;
+        return Ok(out);
     }
     let lim = 1 << 20;
     let bx0 = corners.iter().map(|c| c.0).fold(f64::MAX, f64::min).floor().max(-(lim as f64)) as i32 - 1;
@@ -166,11 +171,19 @@ pub fn warp_surface(src: &Surface, src_rect: Rect, h: &Homography, interp: Inter
     let bx1 = corners.iter().map(|c| c.0).fold(f64::MIN, f64::max).ceil().min(lim as f64) as i32 + 1;
     let by1 = corners.iter().map(|c| c.1).fold(f64::MIN, f64::max).ceil().min(lim as f64) as i32 + 1;
     let dst = Rect::new(bx0, by0, bx1, by1);
+    let dst_pixels = (dst.width() as usize).checked_mul(dst.height() as usize).ok_or(photocraft_raster::AllocationError::SizeOverflow)?;
+    if dst_pixels > MAX_WARP_PIXELS {
+        return Err(photocraft_raster::AllocationError::NotEnoughMemory { bytes: dst_pixels.saturating_mul(fmt.bytes_per_pixel()) });
+    }
     let n = fmt.channels();
     let a = n - 1;
-    let tiles: Vec<Rect> = dst.tiles().map(|tc| tc.rect().intersect(&dst)).filter(|r| !r.is_empty()).collect();
+    let tile_count = dst.tiles().count();
+    let tile_bytes = tile_count.checked_mul(std::mem::size_of::<Rect>()).ok_or(photocraft_raster::AllocationError::SizeOverflow)?;
+    let mut tiles = Vec::new();
+    tiles.try_reserve_exact(tile_count).map_err(|_| photocraft_raster::AllocationError::NotEnoughMemory { bytes: tile_bytes })?;
+    tiles.extend(dst.tiles().map(|tc| tc.rect().intersect(&dst)).filter(|r| !r.is_empty()));
     let src_ref: &Surface = src;
-    let work = |t: &Rect| -> Option<(Rect, Vec<f32>)> {
+    let work = |t: &Rect| -> Result<Option<(Rect, Vec<f32>)>, photocraft_raster::AllocationError> {
         // Source footprint of this tile (inverse-mapped corners), padded for the filter.
         let tc = [(t.x0, t.y0), (t.x1, t.y0), (t.x1, t.y1), (t.x0, t.y1)].map(|(x, y)| inv.apply(x as f64, y as f64));
         let fx0 = tc.iter().map(|c| c.0).fold(f64::MAX, f64::min).floor() as i32 - 3;
@@ -179,10 +192,10 @@ pub fn warp_surface(src: &Surface, src_rect: Rect, h: &Homography, interp: Inter
         let fy1 = tc.iter().map(|c| c.1).fold(f64::MIN, f64::max).ceil() as i32 + 3;
         let foot = Rect::new(fx0, fy0, fx1, fy1).intersect(&src_rect);
         if foot.is_empty() || !src_ref.has_tiles_in(foot) {
-            return None;
+            return Ok(None);
         }
         // Premultiplied source window.
-        let mut px = src_ref.read_region(foot);
+        let mut px = src_ref.try_read_region(foot)?;
         for p in px.chunks_exact_mut(n) {
             let al = p[a];
             for v in &mut p[..a] {
@@ -198,7 +211,11 @@ pub fn warp_surface(src: &Surface, src_rect: Rect, h: &Homography, interp: Inter
             }
         };
         let w = t.width() as usize;
-        let mut outp = vec![0.0f32; w * t.height() as usize * n];
+        let len = w.checked_mul(t.height() as usize).and_then(|v| v.checked_mul(n)).ok_or(photocraft_raster::AllocationError::SizeOverflow)?;
+        let bytes = len.checked_mul(std::mem::size_of::<f32>()).ok_or(photocraft_raster::AllocationError::SizeOverflow)?;
+        let mut outp = Vec::new();
+        outp.try_reserve_exact(len).map_err(|_| photocraft_raster::AllocationError::NotEnoughMemory { bytes })?;
+        outp.resize(len, 0.0f32);
         let mut any = false;
         let mut acc = [0.0f64; 8];
         for y in t.y0..t.y1 {
@@ -252,20 +269,34 @@ pub fn warp_surface(src: &Surface, src_rect: Rect, h: &Homography, interp: Inter
                 outp[o + a] = al as f32;
             }
         }
-        any.then_some((*t, outp))
+        Ok(any.then_some((*t, outp)))
     };
+    let result_bytes = tiles.len().checked_mul(std::mem::size_of::<(Rect, Vec<f32>)>()).ok_or(photocraft_raster::AllocationError::SizeOverflow)?;
+    let mut done = Vec::new();
+    done.try_reserve_exact(tiles.len()).map_err(|_| photocraft_raster::AllocationError::NotEnoughMemory { bytes: result_bytes })?;
+    let done = std::sync::Mutex::new(done);
     #[cfg(not(target_arch = "wasm32"))]
-    let done: Vec<(Rect, Vec<f32>)> = {
+    {
         use rayon::prelude::*;
-        tiles.par_iter().filter_map(work).collect()
-    };
+        tiles.into_par_iter().try_for_each(|tile| -> Result<(), photocraft_raster::AllocationError> {
+            if let Some(result) = work(&tile)? {
+                done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(result);
+            }
+            Ok(())
+        })?;
+    }
     #[cfg(target_arch = "wasm32")]
-    let done: Vec<(Rect, Vec<f32>)> = tiles.iter().filter_map(work).collect();
+    for tile in tiles {
+        if let Some(result) = work(&tile)? {
+            done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(result);
+        }
+    }
+    let done = done.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
     for (r, v) in done {
-        out.write_region(r, &v);
+        out.try_write_region(r, &v)?;
     }
     out.prune();
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -299,7 +330,7 @@ mod tests {
         let r = s.content_bounds();
         for interp in [Interp::Nearest, Interp::Bilinear, Interp::Bicubic] {
             let h = Homography([1.0, 0.0, 7.0, 0.0, 1.0, -3.0, 0.0, 0.0, 1.0]);
-            let o = warp_surface(&s, r, &h, interp);
+            let o = warp_surface(&s, r, &h, interp).unwrap();
             assert_eq!(o.content_bounds(), Rect::new(11, 1, 27, 9), "{interp:?}");
             assert_eq!(o.pixel(15, 5), vec![1.0, 128.0 / 255.0, 0.0, 1.0], "{interp:?}");
         }
@@ -315,12 +346,13 @@ mod tests {
             r,
             &Homography::rect_to_quad([0.0, 0.0, 40.0, 20.0], [[0.0, 0.0], [80.0, 0.0], [80.0, 40.0], [0.0, 40.0]]).unwrap(),
             Interp::Bicubic,
-        );
+        )
+        .unwrap();
         let b = up.content_bounds();
         assert!(b.width() >= 80 && b.width() <= 82 && b.height() >= 40 && b.height() <= 42, "{b:?}");
         // 90° rotation about (20, 10): a 40×20 box becomes 20×40.
         let q = [[30.0, -10.0], [30.0, 30.0], [10.0, 30.0], [10.0, -10.0]];
-        let rot = warp_surface(&s, r, &Homography::rect_to_quad([0.0, 0.0, 40.0, 20.0], q).unwrap(), Interp::Bilinear);
+        let rot = warp_surface(&s, r, &Homography::rect_to_quad([0.0, 0.0, 40.0, 20.0], q).unwrap(), Interp::Bilinear).unwrap();
         let b = rot.content_bounds();
         assert!(b.width().abs_diff(20) <= 2 && b.height().abs_diff(40) <= 2, "{b:?}");
         let p = rot.pixel(20, 10);
@@ -338,7 +370,7 @@ mod tests {
             }
         }
         let h = Homography::rect_to_quad([0.0, 0.0, 64.0, 64.0], [[0.0, 0.0], [8.0, 0.0], [8.0, 8.0], [0.0, 8.0]]).unwrap();
-        let o = warp_surface(&s, s.content_bounds(), &h, Interp::Bicubic);
+        let o = warp_surface(&s, s.content_bounds(), &h, Interp::Bicubic).unwrap();
         let p = o.pixel(4, 4);
         assert!((p[0] - 0.5).abs() < 0.1, "{p:?}");
     }
@@ -348,7 +380,7 @@ mod tests {
         let mut s = Surface::new(PixelFormat::new(photocraft_color::ColorMode::Rgb, photocraft_color::SampleType::U8, false));
         s.fill_rect(Rect::new(0, 0, 10, 10), &[1.0, 0.0, 0.0]);
         let h = Homography([1.0, 0.0, 5.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
-        let o = warp_surface(&s, Rect::new(0, 0, 10, 10), &h, Interp::Nearest);
+        let o = warp_surface(&s, Rect::new(0, 0, 10, 10), &h, Interp::Nearest).unwrap();
         assert!(o.format().alpha);
         assert_eq!(o.pixel(2, 2)[3], 0.0);
         assert_eq!(o.pixel(7, 2), vec![1.0, 0.0, 0.0, 1.0]);

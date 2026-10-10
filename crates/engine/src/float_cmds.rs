@@ -69,7 +69,7 @@ impl CutParts {
             }
             rest.write_region(b, &rp);
             if fill {
-                crate::pixels::fill_surface(&mut rest, b, background, Some(sel), true);
+                crate::pixels::try_fill_surface(&mut rest, b, background, Some(sel), true)?;
             }
             rest.prune();
             piece.write_region(b, &pp);
