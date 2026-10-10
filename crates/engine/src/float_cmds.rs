@@ -109,7 +109,7 @@ impl CutParts {
         let mut out = self.rest.clone();
         let piece = photocraft_algo::resample::translate_surface(&self.piece, dx, dy);
         if self.mask {
-            crate::fill_cmds::composite_over(&mut out, &piece, piece.content_bounds(), None);
+            crate::fill_cmds::composite_over(&mut out, &piece, piece.content_bounds(), None)?;
         } else {
             crate::transform_cmds::composite_over(&mut out, &piece);
         }

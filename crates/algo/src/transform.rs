@@ -355,7 +355,7 @@ mod tests {
         s.fill_rect(Rect::new(0, 0, 100, 100), &[1.0, 0.0, 0.0, 1.0]);
         let r = s.content_bounds();
         let h = Homography::rect_to_quad([0.0, 0.0, 100.0, 100.0], [[0.0, 0.0], [300.0, 0.0], [155.0, 155.0], [0.0, 300.0]]).unwrap();
-        let w = warp_surface(&s, r, &h, Interp::Nearest);
+        let w = warp_surface(&s, r, &h, Interp::Nearest).unwrap();
         for (x, y) in [(20, 20), (252, 14), (252, 42), (14, 252), (42, 252)] {
             let a = w.read_region(Rect::new(x, y, x + 1, y + 1))[3];
             assert!(a > 0.99, "({x},{y}) inside the quad is transparent: {a}");
