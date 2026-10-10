@@ -5,7 +5,7 @@ use photocraft_doc::{Adjustment, Document, Layer, LayerContent};
 use photocraft_geom::Rect;
 use photocraft_raster::{Surface, to_rgba};
 
-/// Composite `layers` inside their visible content bounds and write the result directly into a
+/// Composite `layers` inside their visible composite bounds (effects included) and write the result directly into a
 /// tiled surface. Large merges used to hold both a full-canvas RGBA buffer and a second converted
 /// float buffer at once; banded rendering keeps only one compositor band plus the destination.
 pub fn composite_layers(solo: &Document, format: photocraft_color::PixelFormat, background: Option<[f32; 3]>) -> Surface {
@@ -14,7 +14,9 @@ pub fn composite_layers(solo: &Document, format: photocraft_color::PixelFormat, 
         .layers
         .iter()
         .filter(|layer| layer.visible)
-        .map(|layer| photocraft_compose::layer_bounds(layer, canvas))
+        // Composite bounds include layer effects (a drop shadow reaches past the pixels); `None`
+        // means the layer may draw anywhere.
+        .map(|layer| photocraft_compose::composite_bounds(layer, canvas).unwrap_or(canvas))
         .filter(|bounds| !bounds.is_empty())
         .reduce(|a, b| a.union(&b))
         .unwrap_or(Rect::EMPTY)

@@ -1747,6 +1747,23 @@ mod tests {
     }
 
     #[test]
+    fn merging_keeps_layer_effects_outside_the_pixels() {
+        // A drop shadow reaches past the layer's pixels; the merge must render that far.
+        for depth in [8, 16, 32] {
+            let mut s = session(depth);
+            let lower = rect_layer(&mut s, Rect::new(10, 10, 30, 30));
+            let upper = rect_layer(&mut s, Rect::new(40, 20, 60, 40));
+            s.execute("layer.layerStyle.dropShadow", json!({"layer": upper.0, "blend": "normal", "distance": 12, "size": 4})).unwrap();
+            let before = photocraft_compose::render(doc(&s), doc(&s).bounds());
+            select_all(&mut s, &[lower, upper]);
+            s.execute("layer.mergeLayers", json!({})).unwrap();
+            let after = photocraft_compose::render(doc(&s), doc(&s).bounds());
+            let worst = before.px.iter().zip(&after.px).map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)).fold(0.0f32, f32::max);
+            assert!(worst <= 1.5 / 255.0, "depth {depth}: merge layers dropped the shadow (off by {worst})");
+        }
+    }
+
+    #[test]
     fn merging_a_group_down_preserves_the_composite() {
         for depth in [8, 16, 32] {
             let mut s = session(depth);
