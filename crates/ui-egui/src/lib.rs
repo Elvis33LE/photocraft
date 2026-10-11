@@ -22,6 +22,7 @@ pub mod adjust_ui;
 mod alt_grab;
 pub mod analysis_ui;
 pub mod anchor_tools;
+mod artboard_overview;
 pub mod artboard_tool;
 pub mod artboard_ui;
 mod blend_keys;
@@ -465,6 +466,8 @@ pub struct PhotocraftApp {
     canvases: HashMap<(DocId, u32), canvas::CanvasCache>,
     /// Navigator textures belong to open documents, not the lifetime of the egui context.
     navigator_textures: HashMap<DocId, canvas::NavigatorCache>,
+    /// Cached, revision-scoped previews for the Artboard Overview window.
+    pub(crate) artboard_overview: artboard_overview::Overview,
     /// Display profile readings (#569).
     monitors: monitor_status::State,
     checker: Option<egui::TextureHandle>,
@@ -699,6 +702,7 @@ impl PhotocraftApp {
             services,
             canvases: HashMap::new(),
             navigator_textures: HashMap::new(),
+            artboard_overview: Default::default(),
             monitors: Default::default(),
             checker: None,
             drag: None,
@@ -1667,12 +1671,14 @@ impl eframe::App for PhotocraftApp {
         if chrome && self.ui.panels.dock {
             panels::right_dock(self, ui);
         }
+        artboard_overview::refresh_canvas_diagnostics(self);
         let t = theme::Tokens::get(&ctx);
         let backdrop = if chrome { prefs_ui::pasteboard_color(self).unwrap_or(t.canvas) } else { egui::Color32::BLACK };
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(backdrop)).show(ui, |ui| {
             canvas::document_area(self, ui);
         });
         panels::properties_window(self, &ctx);
+        artboard_overview::show(self, &ctx);
         brush_panel::window(self, &ctx);
         preset_panels::windows(self, &ctx);
         gradient_ui::editor_window(self, &ctx);
