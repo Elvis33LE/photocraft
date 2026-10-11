@@ -16,6 +16,7 @@ pub mod comps;
 pub mod effects;
 pub mod mode;
 pub mod pattern;
+pub mod responsive;
 pub mod slices;
 pub mod text;
 pub mod text_styles;
@@ -875,6 +876,8 @@ pub struct Document {
     pub variables: Variables,
     /// Window › Timeline (None until a video timeline is created).
     pub timeline: Option<Timeline>,
+    /// Responsive layout rules and variant relationships (native `.pcraft` data).
+    pub responsive: responsive::ResponsiveLayout,
 }
 
 /// Where a layer lives in the tree: indices from the root down.
@@ -913,6 +916,7 @@ impl Document {
             slices: Slices::default(),
             variables: Variables::default(),
             timeline: None,
+            responsive: responsive::ResponsiveLayout::default(),
         }
     }
 
@@ -1088,7 +1092,19 @@ impl Document {
     pub fn remove(&mut self, id: LayerId) -> Option<Layer> {
         let path = self.path_of(id)?;
         let (sib, idx) = self.siblings_mut(&path)?;
-        Some(sib.remove(idx))
+        let removed = sib.remove(idx);
+        fn collect(layer: &Layer, ids: &mut std::collections::HashSet<LayerId>) {
+            ids.insert(layer.id);
+            if let Some(children) = layer.children() {
+                for child in children {
+                    collect(child, ids);
+                }
+            }
+        }
+        let mut ids = std::collections::HashSet::new();
+        collect(&removed, &mut ids);
+        self.responsive.remove_layers(&ids);
+        Some(removed)
     }
 
     /// Move a layer up (+1) or down (-1) among its siblings. Returns false at the ends.

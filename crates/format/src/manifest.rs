@@ -15,7 +15,7 @@ use photocraft_geom::{Affine, Size};
 use serde::{Deserialize, Serialize};
 
 /// Current manifest version written by this build.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Hex-encoded BLAKE3 hash (64 chars).
 pub type Hash = String;
@@ -84,6 +84,9 @@ pub struct DocM {
     /// Window › Timeline.
     #[serde(default)]
     pub timeline: Option<photocraft_doc::Timeline>,
+    /// Responsive layout program. Added in manifest v2.
+    #[serde(default)]
+    pub responsive: photocraft_doc::responsive::ResponsiveLayout,
     /// Image › Analysis: measurement scale, count groups, ruler.
     #[serde(default)]
     pub measurement: photocraft_doc::Measurement,
