@@ -2665,7 +2665,6 @@ cameraData	Lens	Objektiv
 	Brush Type	Typ štětce
 	Bulge	Vyboulení
 	Burlap	Pytlovina
-	Burn	Ztmavení
 	Calculations	Výpočty
 	Camera Calibration	Kalibrace fotoaparátu
 	Camera Raw	Camera Raw
@@ -2695,7 +2694,6 @@ cameraData	Lens	Objektiv
 	Clear Selection	Zrušit výběr
 	Clipping Path	Ořezová cesta
 	Clone	Klonovat
-	Clone Stamp	Klonovací razítko
 	Close Window	Zavřít okno
 	Clumped	Shlukované
 	Coarse Dots	Hrubé tečky
@@ -2792,7 +2790,6 @@ cameraData	Lens	Objektiv
 	Distribution	Rozložení
 	Documentation	Dokumentace
 	Documents	Dokumenty
-	Dodge	Zesvětlení
 	Dot	Tečka
 	Double Line	Dvojitá čára
 	Draft	Koncept
@@ -2933,7 +2930,6 @@ cameraData	Lens	Objektiv
 	Highlight Radius	Poloměr světel
 	Highlight Strength	Síla odlesku
 	Highlight Tone	Tón světel
-	History Brush	Štětec historie
 	Horizontal Only	Pouze vodorovně
 	Hotspot	Jádro světla
 	Hsb	HSB
@@ -3021,7 +3017,6 @@ cameraData	Lens	Objektiv
 	Make	Výrobce
 	Make Selection	Vytvořit výběr
 	Make Work Path	Vytvořit pracovní cestu
-	Manual	Ručně
 	Map Document	Dokument mapy
 	Map Layer	Vrstva mapy
 	Map Path	Cesta k mapě
@@ -3137,7 +3132,6 @@ cameraData	Lens	Objektiv
 	Pond Ripples	Vlnky na hladině
 	Poster Edges	Plakátové okraje
 	Posterization	Posterizace
-	Preserve	Zachovat
 	Preset Manager	Správce přednastavení
 	Preview Image	Náhled obrazu
 	Previous	Předchozí
@@ -3278,7 +3272,6 @@ cameraData	Lens	Objektiv
 	Spherize	Sférická deformace
 	Spin	Rotace
 	Spin Blur	Rotační rozostření
-	Sponge	Houba
 	Spot	Reflektor
 	Spot Color	Přímá barva
 	Spot Healing	Bodové retušování
@@ -3301,7 +3294,6 @@ cameraData	Lens	Objektiv
 	Stop	Zastavit
 	Stops	Zarážky
 	Strength	Síla
-	Stretch	Roztáhnout
 	Stroke Color	Barva tahu
 	Stroke Detail	Detail tahů
 	Stroke Direction	Směr tahů
@@ -3336,7 +3328,6 @@ cameraData	Lens	Objektiv
 	Tiny Lens	Drobné čočky
 	To Center	Ke středu
 	Tone Curve	Tónová křivka
-	Tool	Nástroj
 	Tool Options	Možnosti nástroje
 	Toolbars	Panely nástrojů
 	Torn Edges	Roztřepené okraje
