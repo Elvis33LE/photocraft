@@ -48,6 +48,7 @@ tempfile = "3"
 photocraft-ipp = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 photocraft-affinity = { workspace = true, features = ["synth"] }
 # Synthetic camera raw files for the open tests.
 photocraft-raw = { workspace = true, features = ["testgen"] }
