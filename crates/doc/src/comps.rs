@@ -11,7 +11,7 @@ use photocraft_color::{BlendMode, Color};
 use photocraft_geom::Rect;
 use serde::{Deserialize, Serialize};
 
-use crate::{Document, Effects, Layer, LayerContent, LayerId};
+use crate::{Document, Effects, Guides, Layer, LayerContent, LayerId};
 
 /// One layer's state as captured by a comp. `None` = not recorded (PSD comps record only what
 /// their capture flags asked for).
@@ -159,11 +159,14 @@ pub struct Artboard {
     /// Size preset the board was made from ("" = custom).
     #[serde(default)]
     pub preset: String,
+    /// Guides owned by this board, in document pixels. Ownership survives moves and resize.
+    #[serde(default)]
+    pub guides: Guides,
 }
 
 impl Artboard {
     pub fn new(rect: Rect) -> Self {
-        Self { rect, background: ArtboardBackground::White, preset: String::new() }
+        Self { rect, background: ArtboardBackground::White, preset: String::new(), guides: Guides::default() }
     }
 }
 
@@ -211,6 +214,37 @@ impl Layer {
 mod tests {
     use super::*;
     use crate::{ColorMode, PixelFormat, SampleType, Size};
+
+    #[test]
+    fn old_artboard_metadata_defaults_to_no_owned_guides() {
+        let board = Artboard::new(Rect::new(-10, -5, 30, 20));
+        let mut value = serde_json::to_value(&board).unwrap();
+        value.as_object_mut().unwrap().remove("guides");
+        assert_eq!(serde_json::from_value::<Artboard>(value).unwrap(), board);
+    }
+
+    #[test]
+    fn artboard_position_lock_protects_frame_only() {
+        let child = Layer::raster("child", PixelFormat::RGBA8);
+        let child_id = child.id;
+        let mut board = Layer::group("board", vec![child]);
+        if let LayerContent::Group(g) = &mut board.content {
+            g.artboard = Some(Artboard::new(Rect::new(0, 0, 30, 20)));
+        }
+        board.locks.position = true;
+        let board_id = board.id;
+        let mut d = doc();
+        d.layers = vec![board];
+        assert!(d.effective_locks(board_id).position);
+        assert!(!d.effective_locks(child_id).position);
+        d.layers[0].locks.all = true;
+        assert!(d.effective_locks(child_id).all);
+        d.layers[0].locks.all = false;
+        if let LayerContent::Group(g) = &mut d.layers[0].content {
+            g.artboard = None;
+        }
+        assert!(d.effective_locks(child_id).position, "ordinary groups retain inherited position locks");
+    }
 
     fn doc() -> Document {
         let mut d = Document::with_background("t", Size::new(64, 64), ColorMode::Rgb, SampleType::U8, Color::WHITE);

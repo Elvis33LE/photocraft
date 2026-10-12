@@ -91,7 +91,7 @@ pub fn fill(s: &mut Session, p: &Value) -> Result<Value> {
     let channel = crate::channel_cmds::is_channel_target(p);
     let id = if channel { None } else { Some(layer_param(s, p)?) };
     let st = s.active().ok_or(EngineError::NoDocument)?;
-    let doc_bounds = st.doc.bounds();
+    let doc_bounds = if channel { st.doc.bounds() } else { st.doc.editing_bounds(id) };
     let sel = st.doc.selection.clone();
     let area = sel.as_ref().map(|m| m.content_bounds()).unwrap_or(doc_bounds);
     let mut out = json!({ "contents": contents });

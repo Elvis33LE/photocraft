@@ -1040,6 +1040,16 @@ fn front(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<Val
             json!({"from": "any", "to": "rgb"}),
             json!({"from": ["any", "rgb", "grayscale", "cmyk", "lab", "indexed", "bitmap", "duotone", "multichannel"], "to": ["rgb", "grayscale", "cmyk", "lab"]}),
         ),
+        "view.newGuide" => {
+            let mut fields = json!({"orientation":"vertical","position":0});
+            if let Some(f) = fields.as_object_mut() {
+                f.insert("__guideScope".into(), json!(true));
+                if let Some(owner) = crate::rulers::selected_artboard(app) {
+                    f.insert("artboard".into(), json!(owner.0));
+                }
+            }
+            dialog(app, fields, json!({"orientation":["vertical","horizontal"]}))
+        }
         "view.newGuideLayout" => Some(Ok(json!({"dialog": crate::guide_layout_ui::open(app)}))),
         "type.warpText" => Some(Ok(json!({"dialog": crate::dialogs::open_command_dialog(app, id, label)}))),
         "file.export.layersToFiles" => {
@@ -1050,7 +1060,8 @@ fn front(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<Val
                 json!({"format": ["png", "jpg", "psd", "tiff", "webp", "bmp"]}),
             )
         }
-        "file.export.layerCompsToFiles" | "file.export.artboardsToFiles" => {
+        "file.export.artboardsToFiles" => Some(crate::export_dialog::open_artboards(app, false).map(|dialog| json!({"dialog":dialog}))),
+        "file.export.layerCompsToFiles" => {
             let (_, _, name) = doc?;
             let prefix = name.rsplit_once('.').map_or(name.as_str(), |(a, _)| a).to_string();
             let fields = if id == "file.export.layerCompsToFiles" {
@@ -1060,11 +1071,7 @@ fn front(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<Val
             };
             dialog(app, fields, json!({"format": ["png", "jpg", "psd", "tiff", "webp", "bmp"]}))
         }
-        "file.export.artboardsToPdf" => {
-            let (_, _, name) = doc?;
-            let stem = name.rsplit_once('.').map_or(name.as_str(), |(a, _)| a).to_string();
-            dialog(app, json!({"path": format!("{dir}/{stem}.pdf"), "quality": 10}), json!({}))
-        }
+        "file.export.artboardsToPdf" => Some(crate::export_dialog::open_artboards(app, true).map(|dialog| json!({"dialog":dialog}))),
         "layer.new.artboard" => {
             let (w, h, _) = doc?;
             let presets: Vec<&str> = std::iter::once("").chain(photocraft_engine::artboard_cmds::PRESETS.iter().map(|p| p.0)).collect();

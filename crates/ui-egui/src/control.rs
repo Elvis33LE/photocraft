@@ -89,7 +89,10 @@ pub enum Outcome {
 /// field's value is validated before the first one is applied, so a typo, an unknown field, a
 /// bad value or a bad nested key can't reply with success while nothing — or only half of it —
 /// changed (#412).
-pub const UI_SET_FIELDS: [&str; 34] = [
+pub const UI_SET_FIELDS: [&str; 37] = [
+    "artboardProportions",
+    "artboardUnit",
+    "hideArtboardNames",
     "tool",
     "panels",
     "dock",
@@ -452,6 +455,17 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
                 let eyedropper_ring = bool_field(p, "eyedropperRing")?;
                 // Content-Aware Move's Transform On Drop checkbox.
                 let cam_transform_on_drop = bool_field(p, "camTransformOnDrop")?;
+                let artboard_proportions = bool_field(p, "artboardProportions")?;
+                let hide_artboard_names = bool_field(p, "hideArtboardNames")?;
+                let artboard_unit = match p.get("artboardUnit") {
+                    Some(v) => Some(
+                        v.as_str()
+                            .filter(|name| crate::new_doc_ui::UNITS.iter().any(|u| u.0 == *name))
+                            .ok_or("artboardUnit must be px, in, cm, mm, pt or pica")?
+                            .to_string(),
+                    ),
+                    None => None,
+                };
                 // The Crop tool's overlay menu (#1919).
                 let crop_overlay = match p.get("cropOverlay") {
                     Some(v) => Some(v.as_str().and_then(crate::crop_overlay::CropOverlay::from_id).ok_or_else(|| {
@@ -609,6 +623,15 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
                 }
                 if let Some(on) = cam_transform_on_drop {
                     app.ui.tool_options.cam_transform_on_drop = on;
+                }
+                if let Some(v) = artboard_proportions {
+                    app.ui.artboard_proportions = v;
+                }
+                if let Some(v) = hide_artboard_names {
+                    app.ui.hide_artboard_names = v;
+                }
+                if let Some(v) = artboard_unit {
+                    app.ui.artboard_unit = v;
                 }
                 if let Some(k) = crop_overlay {
                     app.ui.tool_options.crop_overlay = k;
@@ -914,6 +937,9 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
             let space = p.get("modifiers").unwrap_or(p).get("space").and_then(Value::as_bool).unwrap_or(false);
             crate::crop_ui::set_space(app, space);
             for (ev, x, y, pr, pen) in events {
+                if matches!(ev, ToolEvent::Down { .. }) {
+                    app.ui.artboard_focus = None;
+                }
                 // With the Color Picker on top the image is its eyedropper, as for the mouse.
                 if crate::color_picker_ui::top(app).is_some() {
                     if !matches!(ev, ToolEvent::Up { .. }) {

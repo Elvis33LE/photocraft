@@ -104,6 +104,34 @@ pub fn clamp_view(view: &mut View, size: egui::Vec2, ppp: f32) -> bool {
     moved
 }
 
+/// Bounds of visible artboards, falling back to document canvas bounds.
+pub fn document_bounds(doc: &photocraft_doc::Document) -> photocraft_geom::Rect {
+    let mut bounds = photocraft_geom::Rect::EMPTY;
+    for (id, _, board) in doc.artboards() {
+        if doc.layer(id).is_some_and(|layer| layer.visible) {
+            bounds = if bounds.is_empty() { board.rect } else { bounds.union(&board.rect) };
+        }
+    }
+    if bounds.is_empty() { doc.bounds() } else { bounds }
+}
+
+/// Clamp view against document-space bounds, including negative artboard positions.
+pub fn clamp_view_in_bounds(view: &mut View, size: egui::Vec2, ppp: f32, bounds: photocraft_geom::Rect) -> bool {
+    if bounds.is_empty() {
+        return false;
+    }
+    let zoom = view.zoom / if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+    let c = [
+        bounds.x0 as f32 + clamp_axis(view.center[0] - bounds.x0 as f32, bounds.width() as f32, size.x, zoom),
+        bounds.y0 as f32 + clamp_axis(view.center[1] - bounds.y0 as f32, bounds.height() as f32, size.y, zoom),
+    ];
+    let moved = (c[0] - view.center[0]).abs() > 1e-3 || (c[1] - view.center[1]).abs() > 1e-3;
+    if moved {
+        view.center = c;
+    }
+    moved
+}
+
 /// A thumb drag in progress: the extent and centre when it began (the extent grows as the view
 /// moves past the image, so it is frozen for the drag).
 #[derive(Clone, Copy, Debug)]

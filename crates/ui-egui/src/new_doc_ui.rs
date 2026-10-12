@@ -595,6 +595,12 @@ pub fn body(app: &mut crate::PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<Strin
                         swap_size(f);
                     }
                 }
+                ui.add_space(4.0);
+                let mut artboards = f.get("artboards").and_then(Value::as_bool).unwrap_or(false);
+                if widgets::checkbox(ui, &mut artboards, tl!("Artboards")).changed() {
+                    f.insert("artboards".into(), json!(artboards));
+                    f.remove("__savedPreset");
+                }
             });
             ui.add_space(4.0);
             small_label(ui, tl!("Resolution"));
@@ -878,6 +884,24 @@ mod tests {
         assert!(f.get("__savedPreset").is_none());
         assert_eq!((f["width"].as_u64(), f["height"].as_u64()), (Some(20), Some(30)));
     }
+    #[test]
+    fn saved_artboard_setting_restores_checkbox_and_create_params() {
+        let mut session = photocraft_engine::Session::new();
+        for artboards in [true, false] {
+            let name = format!("Boards {artboards}");
+            session.execute("document.presets.save", json!({"name":name,"settings":{"width":32,"height":24,"artboards":artboards}})).unwrap();
+            let preset = session.presets.documents.last().unwrap();
+            let mut fields = crate::state::UiState::new_document_fields();
+            fields.insert("artboards".into(), json!(!artboards));
+            apply_saved_preset(&mut fields, preset);
+            assert_eq!(fields["artboards"], artboards);
+            let params = command_params(&fields);
+            assert_eq!(params["artboards"], artboards);
+            session.execute("file.new", params).unwrap();
+            assert_eq!(session.active().unwrap().doc.has_artboards(), artboards);
+        }
+    }
+
     /// The real dialog (#254): a typed size must reach `file.new`, however it is confirmed.
     mod dialog {
         use super::super::{CATEGORIES, apply_preset};
@@ -1299,16 +1323,23 @@ mod tests {
         }
 
         #[test]
-        fn orientation_swap_keeps_whole_pixels() {
+        fn orientation_and_artboards_share_a_row_and_create_the_requested_document() {
             let mut h = harness();
             type_into(&mut h, 0, "512");
             type_into(&mut h, 1, "256");
             // The Portrait icon button follows the "Orientation" label (icons have tooltips only).
             let label = h.get_by_label("Orientation").rect();
             let gap = h.ctx.global_style().spacing.item_spacing.x;
+            let boards = h.get_by_label("Artboards").rect();
+            assert!(boards.left() > label.right() + gap + 48.0, "the checkbox follows both orientation buttons");
+            assert!((boards.center().y - label.center().y).abs() < 8.0, "the checkbox is on the orientation row");
+            h.get_by_label("Artboards").click();
+            h.run_steps(2);
+            assert_eq!(fields(&h)["artboards"], true);
             click_at(&mut h, egui::pos2(label.right() + gap + 12.0, label.center().y));
             enter(&mut h);
             assert_eq!(created(&h), (256, 512, 72.0));
+            assert!(h.state().session.active().unwrap().doc.has_artboards());
         }
     }
 }

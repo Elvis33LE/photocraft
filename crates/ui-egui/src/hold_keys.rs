@@ -75,6 +75,7 @@ pub fn cmd_moves(t: Tool) -> bool {
         && !matches!(
             t,
             Tool::Move
+                | Tool::Artboard
                 | Tool::Hand
                 | Tool::RotateView
                 | Tool::Zoom

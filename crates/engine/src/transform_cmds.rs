@@ -197,7 +197,14 @@ pub fn target_bounds(doc: &Document, surf: &Surface) -> Rect {
 
 /// The locks `id` inherits from the groups around it.
 pub(crate) fn group_locks(doc: &Document, id: LayerId) -> Locks {
-    doc.path_of(id).and_then(|p| Some(doc.locks_at(p.split_last()?.1))).unwrap_or_default()
+    let Some(path) = doc.path_of(id) else { return Locks::default() };
+    (1..path.len()).filter_map(|n| doc.layer_at(path.get(..n)?)).fold(Locks::default(), |inherited, ancestor| {
+        let mut locks = ancestor.locks;
+        if ancestor.artboard().is_some() {
+            locks.position = false;
+        }
+        inherited.union(locks)
+    })
 }
 
 /// The locks a transform of `l` meets: its own and `group`'s (those it inherits). The Background's

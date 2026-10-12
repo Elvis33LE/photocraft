@@ -452,9 +452,31 @@ fn live_kind(l: &LiveShape) -> &'static str {
     }
 }
 
-/// Re-renders a shape layer's cache for `doc` (canvas-clipped, document pixel format).
+/// Re-renders a shape layer's cache for `doc` (workspace-clipped, document pixel format).
 pub fn refresh_shape(doc: &Document, sh: &mut ShapeLayer) {
-    sh.cache = Some(vector::render_shape(sh, doc.pixel_format(), doc.bounds()));
+    if !doc.has_artboards() {
+        sh.cache = Some(vector::render_shape(sh, doc.pixel_format(), doc.bounds()));
+        return;
+    }
+    // Artboards can live left/above the ordinary canvas. Compile once, then render only the
+    // tiles of each workspace region; a bounding rectangle would scan empty gaps between boards.
+    let compiled = vector::CompiledShape::new(sh, vector::DEFAULT_TOLERANCE, doc.bounds());
+    let mut surface = photocraft_raster::Surface::new(doc.pixel_format());
+    let Some(bounds) = compiled.bounds() else {
+        sh.cache = Some(surface);
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    for clip in std::iter::once(doc.bounds()).chain(doc.artboards().into_iter().map(|(_, _, a)| a.rect)) {
+        for tile in bounds.intersect(&clip).tiles() {
+            if seen.insert(tile) {
+                let rect = tile.rect();
+                let mut rendered = compiled.render(doc.pixel_format(), rect);
+                surface.put_tiles(rendered.take_tiles(rect));
+            }
+        }
+    }
+    sh.cache = Some(surface);
 }
 
 /// A staged stroke edit rendered with the same validation and cache refresh as `shape.edit`.

@@ -15,7 +15,7 @@ fn artboard_doc(depth: SampleType, background: ArtboardBackground, blend: BlendM
     let mut g = Layer::group("Artboard 1", vec![red]);
     g.blend = blend;
     if let LayerContent::Group(gr) = &mut g.content {
-        gr.artboard = Some(Artboard { rect: Rect::new(10, 5, 30, 15), background, preset: String::new() });
+        gr.artboard = Some(Artboard { rect: Rect::new(10, 5, 30, 15), background, preset: String::new(), guides: Default::default() });
     }
     d.layers.push(g);
     d

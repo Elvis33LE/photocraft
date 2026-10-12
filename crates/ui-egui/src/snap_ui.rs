@@ -161,6 +161,27 @@ pub(crate) fn retarget_move(app: &mut PhotocraftApp, p: [f64; 2], mods: egui::Mo
     begin(app, p, mods);
 }
 
+/// The Artboard tool chooses its frame/handle before snapping to preserve hit regions.
+pub(crate) fn begin_artboard(app: &mut PhotocraftApp, start: [f64; 2], rect: Option<[f64; 4]>, layer: Option<LayerId>, mods: egui::Modifiers) {
+    let mut exclude: Vec<_> = layer.into_iter().collect();
+    if let Some(root) = layer.and_then(|id| app.session.active().and_then(|st| st.doc.layer(id))) {
+        let mut pending = vec![root];
+        while let Some(item) = pending.pop() {
+            if item.id != root.id {
+                exclude.push(item.id);
+            }
+            if let Some(children) = item.children() {
+                pending.extend(children);
+            }
+        }
+    }
+    let gesture = rect.map_or(Gesture::Point, |rect| Gesture::Move { rect });
+    let targets = if snap_on(app) { build(app, &exclude, false) } else { SnapTargets::default() };
+    let smart = if rect.is_some() && smart_on(app) { build(app, &exclude, true) } else { SnapTargets::default() };
+    app.prefs_rt.snap_lines.clear();
+    app.prefs_rt.snap = Some(ActiveSnap { gesture, start, targets, smart, disabled: override_held(mods) });
+}
+
 /// Start snapping for a drag beginning at `p` with `mods` held (called on pointer down).
 fn begin(app: &mut PhotocraftApp, p: [f64; 2], mods: egui::Modifiers) {
     app.prefs_rt.snap = None;
@@ -410,7 +431,8 @@ pub fn snap_guide(app: &mut PhotocraftApp, vertical: bool, pos: f64) -> f64 {
     }
     let tol = tolerance(app);
     let t = app.prefs_rt.guide_targets.as_ref().map(|(_, t)| t);
-    t.and_then(|t| t.nearest(vertical, pos, tol)).map_or(pos, |t| t.pos)
+    let owner = app.guide_drag.map(|d| d.artboard).unwrap_or_else(|| crate::rulers::selected_artboard(app));
+    t.and_then(|t| t.nearest_on_artboard(vertical, pos, tol, owner)).map_or(pos, |t| t.pos)
 }
 
 fn hex_color(s: &str, fallback: Color32) -> Color32 {
@@ -596,6 +618,33 @@ mod tests {
         // ⌘ on the Mac is not the override.
         let cmd = egui::Modifiers { mac_cmd: true, command: true, ..Default::default() };
         assert!(!override_held(cmd) && override_held(ctrl));
+    }
+
+    #[test]
+    fn artboard_move_does_not_snap_to_its_own_children() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width":100,"height":100,"artboards":true,"background":"transparent"})).unwrap();
+        let board = app.session.active().unwrap().doc.layers[0].id;
+        let child = app.session.active().unwrap().doc.layers[0].children().unwrap()[0].id;
+        app.session
+            .edit("Child", |doc, _| {
+                doc.layer_mut(child).unwrap().surface_mut().unwrap().fill_rect(photocraft_geom::Rect::new(10, 10, 20, 20), &[1.0, 0.0, 0.0, 1.0]);
+                Ok(())
+            })
+            .unwrap();
+        app.sync_views();
+        app.ui.tool = Tool::Artboard;
+        app.ui.extras.snap = true;
+        app.ui.view.snap_to.guides = false;
+        app.ui.view.snap_to.grid = false;
+        app.ui.view.snap_to.document_bounds = false;
+        app.ui.view.snap_to.layers = true;
+        app.ui.view.show.smart_guides = false;
+        let m = egui::Modifiers::NONE;
+        crate::canvas::tool_event(&mut app, ToolEvent::Down { x: 50.0, y: 50.0, pressure: 1.0 }, m);
+        crate::canvas::tool_event(&mut app, ToolEvent::Up { x: 55.0, y: 55.0 }, m);
+        assert_eq!(app.session.active().unwrap().doc.layer(board).unwrap().artboard().unwrap().rect, photocraft_geom::Rect::new(5, 5, 105, 105));
+        assert!(app.prefs_rt.snap.is_none());
     }
 
     #[test]

@@ -36,6 +36,8 @@ impl SnapKind {
 /// axis (for drawing alignment lines between objects).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Target {
+    /// Owned guides are clipped to their board and excluded when that board itself moves.
+    pub artboard: Option<LayerId>,
     pub pos: f64,
     pub kind: SnapKind,
     pub span: (f64, f64),
@@ -109,10 +111,10 @@ impl SnapTargets {
         if opts.guides {
             let artboards: std::collections::HashMap<_, _> = doc.artboards().into_iter().map(|(id, _, board)| (id, board.rect)).collect();
             for g in &doc.guides.vertical {
-                t.x.push(Target { pos: *g, kind: SnapKind::Guide, span: (0.0, h) });
+                t.x.push(Target { artboard: None, pos: *g as f64, kind: SnapKind::Guide, span: (0.0, h) });
             }
             for g in &doc.guides.horizontal {
-                t.y.push(Target { pos: *g, kind: SnapKind::Guide, span: (0.0, w) });
+                t.y.push(Target { artboard: None, pos: *g as f64, kind: SnapKind::Guide, span: (0.0, w) });
             }
             for area in &doc.responsive.safe_areas {
                 let Some(rect) = artboards.get(&area.artboard) else { continue };
@@ -128,6 +130,28 @@ impl SnapTargets {
                 ];
                 if rect[0] < rect[2] && rect[1] < rect[3] {
                     t.add_rect(rect, SnapKind::SafeArea, SnapKind::SafeArea);
+                }
+            }
+            let owners: Vec<LayerId> = exclude.iter().filter_map(|id| doc.artboard_of(*id).filter(|owner| owner != id && !exclude.contains(owner))).collect();
+            for (id, _, board) in doc.artboards() {
+                if exclude.contains(&id) || (!owners.is_empty() && !owners.contains(&id)) || doc.layer(id).is_none_or(|l| !l.visible) {
+                    continue;
+                }
+                for g in board.guides.vertical.iter().filter(|g| f64::from(**g) >= f64::from(board.rect.x0) && f64::from(**g) <= f64::from(board.rect.x1)) {
+                    t.x.push(Target {
+                        artboard: Some(id),
+                        pos: f64::from(*g),
+                        kind: SnapKind::Guide,
+                        span: (f64::from(board.rect.y0), f64::from(board.rect.y1)),
+                    });
+                }
+                for g in board.guides.horizontal.iter().filter(|g| f64::from(**g) >= f64::from(board.rect.y0) && f64::from(**g) <= f64::from(board.rect.y1)) {
+                    t.y.push(Target {
+                        artboard: Some(id),
+                        pos: f64::from(*g),
+                        kind: SnapKind::Guide,
+                        span: (f64::from(board.rect.x0), f64::from(board.rect.x1)),
+                    });
                 }
             }
         }
@@ -150,10 +174,10 @@ impl SnapTargets {
             let b = sel.content_bounds();
             if !b.is_empty() {
                 let r = [b.x0 as f64, b.y0 as f64, b.x1 as f64, b.y1 as f64];
-                t.x.push(Target { pos: r[0], kind: SnapKind::Selection, span: (r[1], r[3]) });
-                t.x.push(Target { pos: r[2], kind: SnapKind::Selection, span: (r[1], r[3]) });
-                t.y.push(Target { pos: r[1], kind: SnapKind::Selection, span: (r[0], r[2]) });
-                t.y.push(Target { pos: r[3], kind: SnapKind::Selection, span: (r[0], r[2]) });
+                t.x.push(Target { artboard: None, pos: r[0], kind: SnapKind::Selection, span: (r[1], r[3]) });
+                t.x.push(Target { artboard: None, pos: r[2], kind: SnapKind::Selection, span: (r[1], r[3]) });
+                t.y.push(Target { artboard: None, pos: r[1], kind: SnapKind::Selection, span: (r[0], r[2]) });
+                t.y.push(Target { artboard: None, pos: r[3], kind: SnapKind::Selection, span: (r[0], r[2]) });
             }
         }
         t
@@ -162,12 +186,12 @@ impl SnapTargets {
     /// Add a rectangle's edges and centre lines.
     pub fn add_rect(&mut self, r: [f64; 4], edge: SnapKind, center: SnapKind) {
         let (xs, ys) = ((r[1], r[3]), (r[0], r[2]));
-        self.x.push(Target { pos: r[0], kind: edge, span: xs });
-        self.x.push(Target { pos: r[2], kind: edge, span: xs });
-        self.x.push(Target { pos: (r[0] + r[2]) / 2.0, kind: center, span: xs });
-        self.y.push(Target { pos: r[1], kind: edge, span: ys });
-        self.y.push(Target { pos: r[3], kind: edge, span: ys });
-        self.y.push(Target { pos: (r[1] + r[3]) / 2.0, kind: center, span: ys });
+        self.x.push(Target { artboard: None, pos: r[0], kind: edge, span: xs });
+        self.x.push(Target { artboard: None, pos: r[2], kind: edge, span: xs });
+        self.x.push(Target { artboard: None, pos: (r[0] + r[2]) / 2.0, kind: center, span: xs });
+        self.y.push(Target { artboard: None, pos: r[1], kind: edge, span: ys });
+        self.y.push(Target { artboard: None, pos: r[3], kind: edge, span: ys });
+        self.y.push(Target { artboard: None, pos: (r[1] + r[3]) / 2.0, kind: center, span: ys });
     }
 
     /// Only the targets for which `keep` holds (e.g. smart guides: layer alignments).
@@ -187,6 +211,23 @@ impl SnapTargets {
     /// The closest target to `v` within `tol` on one axis (`vertical` = x positions). Guides win
     /// ties over other kinds, as in Photoshop.
     pub fn nearest(&self, vertical: bool, v: f64, tol: f64) -> Option<Target> {
+        self.nearest_where(vertical, v, tol, |t| t.artboard.is_none())
+    }
+
+    /// Axis-only guide drags use explicit ownership rather than guessing from a coordinate.
+    pub fn nearest_on_artboard(&self, vertical: bool, v: f64, tol: f64, owner: Option<LayerId>) -> Option<Target> {
+        self.nearest_where(vertical, v, tol, |t| t.artboard.is_none() || t.artboard == owner)
+    }
+
+    fn nearest_in_span(&self, vertical: bool, v: f64, tol: f64, other: (f64, f64)) -> Option<Target> {
+        self.nearest_where(vertical, v, tol, |t| Self::in_span(t, other))
+    }
+
+    fn in_span(t: Target, other: (f64, f64)) -> bool {
+        t.artboard.is_none() || (other.1 >= t.span.0 && other.0 <= t.span.1)
+    }
+
+    fn nearest_where(&self, vertical: bool, v: f64, tol: f64, keep: impl Fn(Target) -> bool) -> Option<Target> {
         let list = if vertical { &self.x } else { &self.y };
         let mut best: Option<(f64, Target)> = None;
         let mut consider = |t: Target| {
@@ -202,12 +243,12 @@ impl SnapTargets {
                 best = Some((d, t));
             }
         };
-        list.iter().copied().for_each(&mut consider);
+        list.iter().copied().filter(|t| keep(*t)).for_each(&mut consider);
         if let Some(steps) = self.grid {
             let step = steps[usize::from(!vertical)];
             let g = (v / step).round() * step;
             let span = if vertical { (self.extent[1], self.extent[3]) } else { (self.extent[0], self.extent[2]) };
-            consider(Target { pos: g, kind: SnapKind::Grid, span });
+            consider(Target { artboard: None, pos: g, kind: SnapKind::Grid, span });
         }
         best.map(|(_, t)| t)
     }
@@ -216,11 +257,11 @@ impl SnapTargets {
     pub fn snap_point(&self, p: [f64; 2], tol: f64) -> ([f64; 2], Vec<SnapLine>) {
         let mut out = p;
         let mut lines = Vec::new();
-        if let Some(t) = self.nearest(true, p[0], tol) {
+        if let Some(t) = self.nearest_in_span(true, p[0], tol, (p[1], p[1])) {
             out[0] = t.pos;
             lines.push(line(true, t, p[1], p[1]));
         }
-        if let Some(t) = self.nearest(false, p[1], tol) {
+        if let Some(t) = self.nearest_in_span(false, p[1], tol, (p[0], p[0])) {
             out[1] = t.pos;
             lines.push(line(false, t, out[0], out[0]));
         }
@@ -236,9 +277,10 @@ impl SnapTargets {
         for (axis, vertical) in [(0usize, true), (1usize, false)] {
             let (a, b) = (r[axis], r[axis + 2]);
             let anchors = [a, (a + b) / 2.0, b];
+            let other = if vertical { (r[1], r[3]) } else { (r[0], r[2]) };
             let mut best: Option<(f64, f64)> = None; // (|d|, d)
             for v in anchors {
-                if let Some(t) = self.nearest(vertical, v, tol) {
+                if let Some(t) = self.nearest_in_span(vertical, v, tol, other) {
                     let d = t.pos - v;
                     if best.is_none_or(|(bd, _)| d.abs() < bd) {
                         best = Some((d.abs(), d));
@@ -247,18 +289,21 @@ impl SnapTargets {
             }
             let Some((_, d)) = best else { continue };
             delta[axis] = d;
-            let other = if vertical { (r[1], r[3]) } else { (r[0], r[2]) };
             for v in anchors {
                 let moved = v + d;
                 let list = if vertical { &self.x } else { &self.y };
-                let hit = list.iter().copied().filter(|t| (t.pos - moved).abs() < 1e-6).min_by_key(|t| u8::from(t.kind != SnapKind::Guide));
+                let hit = list
+                    .iter()
+                    .copied()
+                    .filter(|t| Self::in_span(*t, other) && (t.pos - moved).abs() < 1e-6)
+                    .min_by_key(|t| u8::from(t.kind != SnapKind::Guide));
                 let hit = hit.or_else(|| {
                     self.grid
                         .filter(|steps| {
                             let step = steps[axis];
                             ((moved / step).round() * step - moved).abs() < 1e-6
                         })
-                        .map(|_| Target { pos: moved, kind: SnapKind::Grid, span: other })
+                        .map(|_| Target { artboard: None, pos: moved, kind: SnapKind::Grid, span: other })
                 });
                 if let Some(t) = hit {
                     lines.push(line(vertical, t, other.0, other.1));
@@ -287,7 +332,7 @@ mod tests {
     fn targets() -> SnapTargets {
         let mut t = SnapTargets { extent: [0.0, 0.0, 400.0, 300.0], ..Default::default() };
         t.add_rect([0.0, 0.0, 400.0, 300.0], SnapKind::DocumentEdge, SnapKind::DocumentCenter);
-        t.x.push(Target { pos: 120.0, kind: SnapKind::Guide, span: (0.0, 300.0) });
+        t.x.push(Target { artboard: None, pos: 120.0, kind: SnapKind::Guide, span: (0.0, 300.0) });
         t
     }
 
@@ -315,7 +360,7 @@ mod tests {
     #[test]
     fn guides_win_ties() {
         let mut t = targets();
-        t.x.push(Target { pos: 120.0, kind: SnapKind::LayerEdge, span: (0.0, 10.0) });
+        t.x.push(Target { artboard: None, pos: 120.0, kind: SnapKind::LayerEdge, span: (0.0, 10.0) });
         assert_eq!(t.nearest(true, 121.0, 5.0).unwrap().kind, SnapKind::Guide);
     }
 
@@ -409,5 +454,54 @@ mod tests {
         assert!(!t.x.iter().any(|t| t.kind == SnapKind::Guide || (t.kind == SnapKind::LayerEdge && t.pos == 30.0)));
         assert_eq!(layer_rect(&doc, id), Some([10.0, 20.0, 30.0, 60.0]));
         assert_eq!(union([[0.0, 0.0, 1.0, 1.0], [2.0, -1.0, 3.0, 0.5]]), Some([0.0, -1.0, 3.0, 1.0]));
+    }
+
+    #[test]
+    fn owned_guide_targets_keep_artboard_spans() {
+        let mut d = Document::new("guides", Size::new(100, 100), ColorMode::Rgb, SampleType::U8);
+        let mut l = Layer::group("board", Vec::new());
+        if let LayerContent::Group(g) = &mut l.content {
+            let mut board = photocraft_doc::Artboard::new(photocraft_geom::Rect::new(-30, -20, 10, 30));
+            board.guides.vertical.push(-10.0);
+            g.artboard = Some(board);
+        }
+        d.layers.push(l);
+        let targets = SnapTargets::from_document(&d, &SnapOptions::default(), &[]);
+        let guide = targets.x.iter().find(|t| t.kind == SnapKind::Guide).unwrap();
+        assert_eq!((guide.pos, guide.span), (-10.0, (-20.0, 30.0)));
+        assert_eq!(targets.snap_point([-8.0, 5.0], 3.0).0[0], -10.0);
+        assert_eq!(targets.snap_point([-8.0, 70.0], 3.0).0[0], -8.0, "guides do not extend into another board's rows");
+        assert_eq!(targets.snap_rect([-8.0, 60.0, -5.0, 75.0], 3.0).0[0], 0.0);
+        assert_eq!(targets.nearest_on_artboard(true, -8.0, 3.0, Some(d.layers[0].id)).map(|t| t.pos), Some(-10.0));
+        assert!(targets.nearest_on_artboard(true, -8.0, 3.0, None).is_none());
+        assert!(
+            !SnapTargets::from_document(&d, &SnapOptions::default(), &[d.layers[0].id]).x.iter().any(|t| t.kind == SnapKind::Guide),
+            "a moving board cannot snap to its own moving guides"
+        );
+        d.layers[0].visible = false;
+        assert!(!SnapTargets::from_document(&d, &SnapOptions::default(), &[]).x.iter().any(|t| t.kind == SnapKind::Guide));
+    }
+
+    #[test]
+    fn overlapping_artboards_keep_child_guide_scope() {
+        let mut d = Document::new("guides", Size::new(100, 100), ColorMode::Rgb, SampleType::U8);
+        let child = Layer::raster("child", d.pixel_format());
+        let child_id = child.id;
+        for (name, x, children) in [("A", 20.0, vec![child]), ("B", 30.0, Vec::new())] {
+            let mut l = Layer::group(name, children);
+            if let LayerContent::Group(g) = &mut l.content {
+                let mut board = photocraft_doc::Artboard::new(photocraft_geom::Rect::new(0, 0, 50, 50));
+                board.guides.vertical = vec![x, 70.0];
+                g.artboard = Some(board);
+            }
+            d.layers.push(l);
+        }
+        let targets = SnapTargets::from_document(&d, &SnapOptions::default(), &[child_id]);
+        let positions: Vec<_> = targets.x.iter().filter(|t| t.kind == SnapKind::Guide).map(|t| t.pos).collect();
+        assert_eq!(positions, vec![20.0], "foreign overlapping guides and owned guides outside the frame are excluded");
+        let board_id = d.layers[0].id;
+        let targets = SnapTargets::from_document(&d, &SnapOptions::default(), &[board_id, child_id]);
+        let positions: Vec<_> = targets.x.iter().filter(|t| t.kind == SnapKind::Guide).map(|t| t.pos).collect();
+        assert_eq!(positions, vec![30.0], "a whole-board move excludes its own guides and can snap to another board");
     }
 }

@@ -2668,7 +2668,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
                 }
             }
             if primary {
-                crate::artboard_ui::draw_frames(app, &painter, &xf);
+                crate::artboard_ui::draw_frames(app, &doc, &painter, &xf);
             }
         }
 
@@ -4450,7 +4450,8 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
     if let ToolEvent::Down { x, y, .. } = raw
         && let Some((vertical, i)) = command_guide_at(app, app.active_tool(), [x, y], mods)
     {
-        app.guide_drag = Some(crate::rulers::GuideDrag { vertical, index: Some(i), pos: if vertical { x } else { y } });
+        app.guide_drag =
+            Some(crate::rulers::GuideDrag { artboard: crate::rulers::guide_owner_at(app, x, y), vertical, index: Some(i), pos: if vertical { x } else { y } });
         crate::snap_ui::begin_guide(app, [x, y]);
         return;
     }
@@ -4494,7 +4495,12 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
     match ev {
         ToolEvent::Down { x, y, pressure } if tool == Tool::Move => {
             if let Some((vertical, i)) = crate::rulers::guide_at(app, x, y) {
-                app.guide_drag = Some(crate::rulers::GuideDrag { vertical, index: Some(i), pos: if vertical { x } else { y } });
+                app.guide_drag = Some(crate::rulers::GuideDrag {
+                    artboard: crate::rulers::guide_owner_at(app, x, y),
+                    vertical,
+                    index: Some(i),
+                    pos: if vertical { x } else { y },
+                });
                 return;
             }
             // Auto-Select (or ⌘-click while it is off) picks the layer under the pointer first
@@ -5035,7 +5041,7 @@ pub(crate) fn finish_gesture(app: &mut PhotocraftApp, d: Drag) {
         }
         Tool::Move => {
             let (dx, dy) = ((end[0] - d.start[0]).round(), (end[1] - d.start[1]).round());
-            crate::move_ui::finish(app, dx, dy);
+            crate::move_ui::finish(app, dx, dy, [end[0], end[1]]);
         }
         _ => {}
     }

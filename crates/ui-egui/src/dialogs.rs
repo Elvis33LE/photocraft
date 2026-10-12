@@ -231,6 +231,8 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 800.0
             } else if about_tabs {
                 700.0
+            } else if d.fields.contains_key("__artboards") {
+                840.0
             } else if d.kind == DialogKind::LayerStyle || d.fields.contains_key("__export") || crate::color_picker_ui::owns(&d.fields) {
                 600.0
             } else {
@@ -307,9 +309,16 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 }
                 DialogKind::Command if crate::color_range_ui::owns(&fields) => crate::color_range_ui::body(app, ui, &mut fields),
                 DialogKind::Command if crate::prefs_ui::owns(&fields) => crate::prefs_ui::body(app, ui, &mut fields),
-                DialogKind::Command if fields.contains_key("__export") => crate::export_dialog::body(app, ui, &mut fields),
+                DialogKind::Command if fields.contains_key("__export") => {
+                    let room = (ctx.content_rect().height() - DIALOG_CHROME).max(120.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt(id.with("export-body"))
+                        .max_height(room)
+                        .show(ui, |ui| crate::export_dialog::body(app, ui, &mut fields));
+                }
                 // Image Size and Canvas Size open on Width, selected (#2329).
                 DialogKind::Command if fields.contains_key("__sizing") => first_field_focused(ui, id, |ui| crate::sizing::body(ui, &mut fields)),
+                DialogKind::Command if fields.contains_key("__guideScope") => crate::rulers::guide_form(app, ui, &mut fields),
                 DialogKind::Command if crate::adjust_dialog::owns(&fields) => crate::adjust_dialog::body(app, ui, &mut fields),
                 DialogKind::Command if fields.contains_key("__filter") => {
                     // Color Settings: the monitor profile in use can change while it is open.

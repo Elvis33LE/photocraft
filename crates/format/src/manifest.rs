@@ -250,7 +250,8 @@ pub enum ContentM {
     Group {
         children: Vec<LayerM>,
         expanded: bool,
-        /// Artboard (Layer › New › Artboard).
+        /// Artboard (Layer › New › Artboard), including its owned guides. The directly
+        /// serialized model supplies defaults for older manifests without guide ownership.
         #[serde(default)]
         artboard: Option<photocraft_doc::Artboard>,
     },

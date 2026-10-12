@@ -58,8 +58,8 @@ struct Ex {
     canvas: photocraft_geom::Rect,
     records: Vec<LayerRecord>,
     warnings: Vec<String>,
-    /// Guides (artboard blocks list the guides inside each board).
-    guides: photocraft_doc::Guides,
+    /// Owned guide indices in resource 1032's order.
+    artboard_guides: std::collections::HashMap<photocraft_doc::LayerId, Vec<i32>>,
     /// Layer comps to regenerate into each layer's `cmls`; None = preserved data still matches.
     comps: Option<(Vec<photocraft_doc::LayerComp>, Option<photocraft_doc::LayerComp>)>,
     /// Explicit semantic artboard roles, keyed by document layer id.
@@ -612,7 +612,7 @@ impl Ex {
         if !matches!(l.content, LayerContent::Shape(_)) {
             self.vector_mask_block(l, &mut raw);
         }
-        crate::comps_map::artboard_block(&self.guides, l, &mut raw);
+        crate::comps_map::artboard_block(self.artboard_guides.get(&l.id).map(Vec::as_slice).unwrap_or_default(), l, &mut raw);
         if let Some((comps, last)) = &self.comps {
             // Ids are assigned to every layer before emitting.
             let id = self.layer_ids.get(&l.id).copied().unwrap_or(0);
@@ -1068,13 +1068,12 @@ fn guides_resource(doc: &Document) -> Vec<u8> {
     v.extend_from_slice(&1u32.to_be_bytes());
     v.extend_from_slice(&576u32.to_be_bytes());
     v.extend_from_slice(&576u32.to_be_bytes());
-    let n = doc.guides.horizontal.len() + doc.guides.vertical.len();
+    let guides = crate::comps_map::psd_guides(doc);
+    let n = guides.len();
     v.extend_from_slice(&(n as u32).to_be_bytes());
-    for (list, dir) in [(&doc.guides.vertical, 0u8), (&doc.guides.horizontal, 1u8)] {
-        for p in list {
-            v.extend_from_slice(&((p * 32.0).round() as i32).to_be_bytes());
-            v.push(dir);
-        }
+    for (p, dir, _) in guides {
+        v.extend_from_slice(&((p * 32.0).round() as i32).to_be_bytes());
+        v.push(dir);
     }
     v
 }
@@ -1308,7 +1307,15 @@ fn document_to_psd_nested(doc: &Document, opts: &PsdExportOptions, depth: u32, c
         canvas: doc.bounds(),
         records: Vec::new(),
         warnings: Vec::new(),
-        guides: doc.guides.clone(),
+        artboard_guides: {
+            let mut indices: std::collections::HashMap<_, Vec<i32>> = Default::default();
+            for (i, (_, _, owner)) in crate::comps_map::psd_guides(doc).into_iter().enumerate() {
+                if let (Some(id), Ok(index)) = (owner, i32::try_from(i)) {
+                    indices.entry(id).or_default().push(index);
+                }
+            }
+            indices
+        },
         comps: (!crate::comps_map::comps_unchanged(doc)).then(|| (doc.layer_comps.clone(), doc.last_document_state.clone())),
         semantic_roles: doc
             .metadata
@@ -1443,7 +1450,7 @@ fn document_to_psd_nested(doc: &Document, opts: &PsdExportOptions, depth: u32, c
     if let Some(icc) = &doc.icc_profile {
         resources.push(ImageResource::new(ids::ICC_PROFILE, icc.to_vec()));
     }
-    if !doc.guides.horizontal.is_empty() || !doc.guides.vertical.is_empty() {
+    if !crate::comps_map::psd_guides(doc).is_empty() {
         resources.push(ImageResource::new(1032, guides_resource(doc)));
     }
     if !extra.is_empty() {

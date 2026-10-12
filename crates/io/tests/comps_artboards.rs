@@ -128,13 +128,22 @@ fn synthetic(depth: SampleType) -> Document {
     let mut g1 = Layer::group("Board 1", vec![a]);
     let mut g2 = Layer::group("Board 2", vec![b]);
     if let LayerContent::Group(g) = &mut g1.content {
-        g.artboard = Some(Artboard { rect: Rect::new(0, 0, 40, 40), background: ArtboardBackground::White, preset: "Custom".into() });
+        g.artboard =
+            Some(Artboard { rect: Rect::new(0, 0, 40, 40), background: ArtboardBackground::White, preset: "Custom".into(), guides: Default::default() });
     }
     if let LayerContent::Group(g) = &mut g2.content {
-        g.artboard =
-            Some(Artboard { rect: Rect::new(40, 0, 80, 40), background: ArtboardBackground::Custom(Color::rgb(0.0, 1.0, 0.0)), preset: String::new() });
+        g.artboard = Some(Artboard {
+            rect: Rect::new(40, 0, 80, 40),
+            background: ArtboardBackground::Custom(Color::rgb(0.0, 1.0, 0.0)),
+            preset: String::new(),
+            guides: Default::default(),
+        });
     }
     d.layers = vec![g1, g2];
+    d.guides.vertical = vec![5.0];
+    d.layers[0].artboard_mut().unwrap().guides.vertical = vec![5.0, -10.0];
+    d.layers[0].artboard_mut().unwrap().guides.horizontal = vec![0.0, 40.0];
+    d.layers[1].artboard_mut().unwrap().guides.vertical = vec![5.0, 80.0];
     let states = capture_states(&d);
     d.layer_comps.push(LayerComp {
         id: 11,
@@ -215,6 +224,25 @@ fn semantic_artboard_roles_survive_native_psd_roundtrip() {
 }
 
 #[test]
+fn owned_guides_and_locks_roundtrip_psb_with_negative_board_origin() {
+    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+        let mut d = synthetic(depth);
+        let board = d.layers[0].artboard_mut().unwrap();
+        board.rect = board.rect.translate(-10, -15);
+        board.guides.translate(-10, -15);
+        d.layers[0].locks.position = true;
+        d.layers[0].locks.artboard = true;
+        let bytes = export(&d, "x.psb", &ExportOptions::default()).unwrap().bytes;
+        let back = import("x.psb", &bytes).unwrap().document;
+        let original = d.artboards().into_iter().map(|(_, name, a)| (name.to_string(), a.clone())).collect::<Vec<_>>();
+        let imported = back.artboards().into_iter().map(|(_, name, a)| (name.to_string(), a.clone())).collect::<Vec<_>>();
+        assert_eq!(imported, original, "{depth:?}");
+        assert_eq!(back.guides, d.guides);
+        assert_eq!(back.layers[0].locks, d.layers[0].locks);
+    }
+}
+
+#[test]
 fn synthetic_pcraft_roundtrip_keeps_everything() {
     let mut d = synthetic(SampleType::U16);
     d.last_document_state = Some(LayerComp {
@@ -232,7 +260,9 @@ fn synthetic_pcraft_roundtrip_keeps_everything() {
     assert_eq!(back.last_applied_comp, d.last_applied_comp);
     assert_eq!(back.last_document_state, d.last_document_state);
     assert_eq!(back.artboards().len(), 2);
+    assert_eq!(back.layers[0].artboard(), d.layers[0].artboard());
     assert_eq!(back.layers[1].artboard(), d.layers[1].artboard());
+    assert_eq!(back.guides, d.guides);
     // Remapped ids still point at the same layers.
     let fresh = photocraft_format::load_from_bytes_with(&bytes, &photocraft_format::LoadOptions { preserve_ids: false, ..Default::default() }).unwrap();
     let c = &fresh.layer_comps[0];

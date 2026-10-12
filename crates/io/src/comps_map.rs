@@ -13,7 +13,7 @@
 //! regenerated otherwise (comp appearance is not written to PSD; `.pcraft` keeps it).
 
 use photocraft_doc::comps::layer_position;
-use photocraft_doc::{Artboard, ArtboardBackground, CompLayerState, Document, Guides, Layer, LayerComp};
+use photocraft_doc::{Artboard, ArtboardBackground, CompLayerState, Document, Guides, Layer, LayerComp, LayerId};
 use photocraft_geom::Rect;
 use photocraft_psd::descriptor::{Descriptor, UnicodeString, Value, VersionedDescriptor};
 use photocraft_psd::metadata::{MetadataItem, parse_shmd, write_shmd};
@@ -117,7 +117,78 @@ pub fn parse_artboard(data: &[u8]) -> Option<Artboard> {
         _ => ArtboardBackground::White,
     };
     let preset = text(d, "artboardPresetName").unwrap_or_default();
-    Some(Artboard { rect, background, preset })
+    Some(Artboard { rect, background, preset, guides: Guides::default() })
+}
+
+/// Resource 1032 order, shared by its writer and the artboard index mapper. Coincident guides
+/// remain distinct: a document guide and an owned guide must never acquire the other's owner.
+pub(crate) fn psd_guides(doc: &Document) -> Vec<(f64, u8, Option<LayerId>)> {
+    let boards = doc.artboards();
+    let mut out = Vec::new();
+    for vertical in [true, false] {
+        let dir = if vertical { 0 } else { 1 };
+        let list = if vertical { &doc.guides.vertical } else { &doc.guides.horizontal };
+        out.extend(list.iter().map(|p| (*p, dir, None)));
+        for (id, _, board) in &boards {
+            let list = if vertical { &board.guides.vertical } else { &board.guides.horizontal };
+            out.extend(list.iter().map(|p| (*p, dir, Some(*id))));
+        }
+    }
+    out
+}
+
+fn guide_indices(data: &[u8]) -> Option<Vec<i32>> {
+    let (vd, _) = VersionedDescriptor::parse_prefix(data).ok()?;
+    let Value::List(indices) = vd.descriptor.get("guideIndeces")? else { return None };
+    Some(indices.iter().map(|v| if let Value::Integer(i) = v { *i } else { -1 }).collect())
+}
+
+/// Applies explicit PSD guide ownership after layers have their runtime ids. Missing ownership
+/// in older files leaves guides on the document. Invalid indices are ignored with a warning.
+pub(crate) fn import_artboard_guides(doc: &mut Document, resource: Option<&[u8]>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(data) = resource else { return warnings };
+    let Some(count) = data.get(12..16).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_be_bytes) else { return warnings };
+    let lines: Vec<(f64, u8)> = data
+        .get(16..)
+        .unwrap_or_default()
+        .as_chunks::<5>()
+        .0
+        .iter()
+        .take(count as usize)
+        .filter_map(|b| {
+            let bytes = <[u8; 4]>::try_from(b.get(..4)?).ok()?;
+            Some((f64::from(i32::from_be_bytes(bytes)) / 32.0, *b.get(4)?))
+        })
+        .collect();
+    let mut claimed = vec![false; lines.len()];
+    let boards: Vec<LayerId> = doc.artboards().iter().map(|b| b.0).collect();
+    for id in boards {
+        let Some(layer) = doc.layer_mut(id) else { continue };
+        let indices = layer.psd_blocks.iter().find(|(k, _)| ARTBOARD_KEYS.contains(&k)).and_then(|(_, data)| guide_indices(data));
+        let Some(indices) = indices else { continue };
+        let name = layer.name.clone();
+        let Some(board) = layer.artboard_mut() else { continue };
+        for index in indices {
+            let Some((slot, (coordinate, orientation))) = usize::try_from(index).ok().and_then(|i| lines.get(i).copied().map(|line| (i, line))) else {
+                warnings.push(format!("artboard \"{name}\": invalid guide index {index} was not imported"));
+                continue;
+            };
+            if let Some(claim) = claimed.get_mut(slot) {
+                *claim = true;
+            }
+            let guides = if orientation == 1 { &mut board.guides.horizontal } else { &mut board.guides.vertical };
+            guides.push(coordinate);
+        }
+    }
+    doc.guides = Guides::default();
+    for ((pos, dir), claimed) in lines.into_iter().zip(claimed) {
+        if !claimed {
+            let guides = if dir == 1 { &mut doc.guides.horizontal } else { &mut doc.guides.vertical };
+            guides.push(pos);
+        }
+    }
+    warnings
 }
 
 /// Encodes an `artb` block. `guides` are indices into the document's guide list (resource 1032)
@@ -148,20 +219,76 @@ pub fn guides_in(guides: &Guides, r: Rect) -> Vec<i32> {
 }
 
 /// Keeps, regenerates or removes the artboard block among a layer's raw blocks.
-pub(crate) fn artboard_block(guides: &Guides, l: &Layer, raw: &mut Vec<([u8; 4], Vec<u8>)>) {
+pub(crate) fn artboard_block(guides: &[i32], l: &Layer, raw: &mut Vec<([u8; 4], Vec<u8>)>) {
     let pos = raw.iter().position(|(k, _)| ARTBOARD_KEYS.contains(&k));
     match (l.artboard(), pos) {
         (None, Some(_)) => raw.retain(|(k, _)| !ARTBOARD_KEYS.contains(&k)),
         (None, None) => {}
-        (Some(a), Some(i)) if parse_artboard(&raw[i].1).as_ref() == Some(a) => {}
+        (Some(a), Some(i))
+            if raw.get(i).is_some_and(|(_, data)| {
+                parse_artboard(data).is_some_and(|old| old.rect == a.rect && old.background == a.background && old.preset == a.preset)
+                    && guide_indices(data).unwrap_or_default() == guides
+            }) => {}
         (Some(a), pos) => {
-            let data = write_artboard(a, &guides_in(guides, a.rect));
+            let data = write_artboard(a, guides);
             match pos {
-                Some(i) => raw[i] = (*b"artb", data),
+                Some(i) => {
+                    if let Some((_, old)) = raw.get_mut(i) {
+                        *old = merge_artboard_descriptor(old, &data);
+                    }
+                }
                 None => raw.push((*b"artb", data)),
             }
         }
     }
+}
+
+/// Replaces mapped properties only. Unknown top-level and nested descriptor items survive edits.
+fn merge_artboard_descriptor(old: &[u8], new: &[u8]) -> Vec<u8> {
+    fn merge(old: &mut Descriptor, new: Descriptor) {
+        old.class_id = new.class_id;
+        for (key, value) in new.items {
+            if let Some((_, previous)) = old.items.iter_mut().find(|(k, _)| k.as_bytes() == key.as_bytes()) {
+                match (previous, value) {
+                    (Value::Descriptor(a), Value::Descriptor(b)) => {
+                        if key.is("Clr ") {
+                            // Photoshop's float RGB keys take precedence over the older 0..255
+                            // keys. Remove stale mapped channels when the representation changes.
+                            const CHANNELS: &[&str] = &[
+                                "redFloat",
+                                "greenFloat",
+                                "blueFloat",
+                                "Rd  ",
+                                "Grn ",
+                                "Bl  ",
+                                "Cyn ",
+                                "Mgnt",
+                                "Ylw ",
+                                "Blck",
+                                "Gry ",
+                                "Lmnc",
+                                "A   ",
+                                "B   ",
+                                "H   ",
+                                "Strt",
+                                "Brgh",
+                            ];
+                            a.items.retain(|(k, _)| {
+                                !CHANNELS.iter().any(|channel| k.is(channel)) || b.items.iter().any(|(new_key, _)| new_key.as_bytes() == k.as_bytes())
+                            });
+                        }
+                        merge(a, b);
+                    }
+                    (previous, value) => *previous = value,
+                }
+            } else {
+                old.items.push((key, value));
+            }
+        }
+    }
+    let (Ok((mut old, _)), Ok((new, _))) = (VersionedDescriptor::parse_prefix(old), VersionedDescriptor::parse_prefix(new)) else { return new.to_vec() };
+    merge(&mut old.descriptor, new.descriptor);
+    pad_even(old.to_bytes())
 }
 
 // ---------------------------------------------------------------- layer comps
@@ -379,8 +506,82 @@ mod tests {
     use photocraft_doc::{Color, ColorMode, LayerContent, PixelFormat, SampleType, Size};
 
     #[test]
+    fn artboard_edits_preserve_unknown_descriptor_fields_and_blocks() {
+        let mut l = Layer::group("board", Vec::new());
+        let a = Artboard::new(Rect::new(-20, -10, 30, 40));
+        if let LayerContent::Group(g) = &mut l.content {
+            g.artboard = Some(a.clone());
+        }
+        let (mut vd, _) = VersionedDescriptor::parse_prefix(&write_artboard(&a, &[0])).unwrap();
+        vd.descriptor = vd.descriptor.with("unknownArtboardValue", Value::Integer(123));
+        let rect = vd.descriptor.items.iter_mut().find(|(key, _)| key.is("artboardRect")).unwrap();
+        if let Value::Descriptor(d) = &mut rect.1 {
+            d.items.push((photocraft_psd::descriptor::Id::new("unknownRectValue"), Value::Boolean(true)));
+        }
+        let old = pad_even(vd.to_bytes());
+        let mut raw = vec![(*b"artb", old.clone()), (*b"zzzz", vec![7, 8])];
+        artboard_block(&[0], &l, &mut raw);
+        assert_eq!(raw[0].1, old, "unchanged metadata stays byte-identical");
+        l.artboard_mut().unwrap().background = ArtboardBackground::Black;
+        artboard_block(&[1, 2], &l, &mut raw);
+        assert_ne!(raw[0].1, old);
+        let (back, _) = VersionedDescriptor::parse_prefix(&raw[0].1).unwrap();
+        assert_eq!(back.descriptor.get("unknownArtboardValue"), Some(&Value::Integer(123)));
+        assert_eq!(desc(&back.descriptor, "artboardRect").unwrap().get("unknownRectValue"), Some(&Value::Boolean(true)));
+        assert_eq!(guide_indices(&raw[0].1), Some(vec![1, 2]));
+        assert_eq!(raw[1], (*b"zzzz", vec![7, 8]));
+        let before_guide_edit = raw[0].1.clone();
+        artboard_block(&[], &l, &mut raw);
+        assert_ne!(raw[0].1, before_guide_edit, "guide-only edits invalidate preserved indices");
+    }
+
+    #[test]
+    fn malformed_guide_indices_warn_without_claiming_document_guides() {
+        let mut d = Document::new("guides", Size::new(30, 40), ColorMode::Rgb, SampleType::U8);
+        let mut l = Layer::group("board", Vec::new());
+        let a = Artboard::new(Rect::new(0, 0, 30, 40));
+        if let LayerContent::Group(g) = &mut l.content {
+            g.artboard = Some(a.clone());
+        }
+        l.psd_blocks.push((*b"artb", std::sync::Arc::new(write_artboard(&a, &[-1, i32::MAX]))));
+        d.layers.push(l);
+        let mut resource = vec![0; 12];
+        resource.extend_from_slice(&1u32.to_be_bytes());
+        resource.extend_from_slice(&320i32.to_be_bytes());
+        resource.push(0);
+        let warnings = import_artboard_guides(&mut d, Some(&resource));
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(d.guides.vertical, vec![10.0]);
+        assert!(d.artboards()[0].2.guides.vertical.is_empty());
+    }
+
+    #[test]
+    fn edited_float_rgb_background_replaces_stale_color_channels() {
+        let mut l = Layer::group("board", Vec::new());
+        let a = Artboard { background: ArtboardBackground::Custom(Color::rgb(1.0, 0.0, 0.0)), ..Artboard::new(Rect::new(0, 0, 10, 10)) };
+        if let LayerContent::Group(g) = &mut l.content {
+            g.artboard = Some(a.clone());
+        }
+        let (mut vd, _) = VersionedDescriptor::parse_prefix(&write_artboard(&a, &[])).unwrap();
+        let (_, color) = vd.descriptor.items.iter_mut().find(|(key, _)| key.is("Clr ")).unwrap();
+        *color = Value::Descriptor(
+            Descriptor::new("RGBC").with("redFloat", Value::Double(1.0)).with("greenFloat", Value::Double(0.0)).with("blueFloat", Value::Double(0.0)),
+        );
+        let mut raw = vec![(*b"artb", pad_even(vd.to_bytes()))];
+        l.artboard_mut().unwrap().background = ArtboardBackground::Custom(Color::gray(0.5));
+        artboard_block(&[], &l, &mut raw);
+        let back = parse_artboard(&raw[0].1).unwrap();
+        assert_eq!(back.background, ArtboardBackground::Custom(Color::gray(0.5)));
+    }
+
+    #[test]
     fn artboard_roundtrip() {
-        let a = Artboard { rect: Rect::new(10, 20, 110, 220), background: ArtboardBackground::Custom(Color::rgb(0.2, 0.4, 0.6)), preset: "Web".into() };
+        let a = Artboard {
+            rect: Rect::new(10, 20, 110, 220),
+            background: ArtboardBackground::Custom(Color::rgb(0.2, 0.4, 0.6)),
+            preset: "Web".into(),
+            guides: Default::default(),
+        };
         let b = write_artboard(&a, &[0, 2]);
         assert_eq!(b.len() % 2, 0);
         let back = parse_artboard(&b).unwrap();

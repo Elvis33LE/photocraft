@@ -1308,15 +1308,17 @@ fn new_guide_layout(s: &mut Session, p: &Value) -> Result<Value> {
 fn guides_from_shape(s: &mut Session, p: &Value) -> Result<Value> {
     let id = layer_param(s, p)?;
     let d = s.active().ok_or(EngineError::NoDocument)?;
+    let owner = if p.get("artboard").is_some() { crate::edit_cmds::guide_owner(&d.doc, p)? } else { d.doc.artboard_of(id) };
     let l = d.doc.layer(id).ok_or(EngineError::NoLayer(id))?;
     let LayerContent::Shape(sh) = &l.content else { return Err(EngineError::Other("the layer is not a shape layer".into())) };
     let (x0, y0, x1, y1) = sh.path.control_bounds().ok_or(EngineError::Other("the shape has no path".into()))?;
     s.edit("New Guides From Shape", |doc, _| {
+        let guides = crate::edit_cmds::owned_guides(doc, owner)?;
         for x in [x0, (x0 + x1) / 2.0, x1] {
-            push_unique(&mut doc.guides.vertical, x);
+            push_unique(&mut guides.vertical, x);
         }
         for y in [y0, (y0 + y1) / 2.0, y1] {
-            push_unique(&mut doc.guides.horizontal, y);
+            push_unique(&mut guides.horizontal, y);
         }
         Ok(())
     })?;
@@ -1508,7 +1510,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_doc,
             new_guide_layout
         ),
-        spec!("view.newGuidesFromShape", "New Guides From Shape", &["View"], None, r##"{"layer":id?}"##, has_shape, guides_from_shape),
+        spec!(
+            "view.newGuidesFromShape",
+            "New Guides From Shape",
+            &["View"],
+            None,
+            r##"{"layer":id?,"artboard":id?} (defaults to the shape's owning artboard or document)"##,
+            has_shape,
+            guides_from_shape
+        ),
         spec!("view.clearCanvasGuides", "Clear Canvas Guides", &["View"], None, "{}", has_doc, |s, _| clear_canvas_guides(s)),
     ]
 }

@@ -422,10 +422,14 @@ fn layer_via(s: &mut Session, cut: bool) -> Result<Value> {
         // No selection: Layer via Copy duplicates the whole layer (Photoshop).
         let nid = s.edit("Layer Via Copy", |doc, active| {
             let src = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+            let artboard = src.artboard().is_some();
             let mut dup = src.duplicate();
             dup.name = doc.copy_name(&src.name);
             dup.locks = Default::default();
             let nid = doc.insert_above(Some(id), dup);
+            if artboard {
+                crate::artboard_cmds::place_copy(doc, nid)?;
+            }
             *active = Some(nid);
             Ok(nid)
         })?;
@@ -730,11 +734,28 @@ fn guide_color(p: &Value) -> Result<Option<[u8; 3]>> {
 }
 
 /// View › New Guide / guide moves (undoable, like Photoshop's "New Guide"/"Move Guide" states).
+pub(crate) fn guide_owner(doc: &Document, p: &Value) -> Result<Option<LayerId>> {
+    let Some(value) = p.get("artboard") else { return Ok(None) };
+    let id = value.as_u64().map(LayerId).ok_or_else(|| EngineError::Other("`artboard` must be a layer id".into()))?;
+    if doc.layer(id).and_then(Layer::artboard).is_none() || doc.artboard_of(id) != Some(id) {
+        return Err(EngineError::Other("the guide owner is not an artboard".into()));
+    }
+    Ok(Some(id))
+}
+
+pub(crate) fn owned_guides(doc: &mut Document, owner: Option<LayerId>) -> Result<&mut photocraft_doc::Guides> {
+    match owner {
+        None => Ok(&mut doc.guides),
+        Some(id) => doc.layer_mut(id).and_then(Layer::artboard_mut).map(|a| &mut a.guides).ok_or(EngineError::NoLayer(id)),
+    }
+}
+
 fn guide_cmd(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
+    let owner = guide_owner(&s.active().ok_or(EngineError::NoDocument)?.doc, p)?;
     let vertical = p.get("orientation").and_then(Value::as_str).unwrap_or("horizontal") == "vertical";
     let pos = guide_position(s, p, vertical)?;
     let color = if op == "new" { guide_color(p)? } else { None };
-    let index = p.get("index").and_then(Value::as_u64).map(|v| v as usize);
+    let index = p.get("index").and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok());
     let label = match op {
         "new" => "New Guide",
         "move" => "Move Guide",
@@ -742,7 +763,7 @@ fn guide_cmd(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
         _ => "Clear Guides",
     };
     s.edit(label, |doc, _| {
-        let guides = &mut doc.guides;
+        let guides = owned_guides(doc, owner)?;
         let g = if vertical { &mut guides.vertical } else { &mut guides.horizontal };
         match op {
             "new" => {
@@ -878,12 +899,16 @@ pub fn specs() -> Vec<CommandSpec> {
             "Move Guide",
             &[],
             None,
-            r##"{"orientation":"horizontal|vertical","index":n,"position":px or "<number><unit>"} (units as for view.newGuide)"##,
+            r##"{"orientation":"horizontal|vertical","index":n,"position":px or "<number><unit>","artboard":id?} (units as for view.newGuide)"##,
             has_doc,
             |s, p| guide_cmd(s, p, "move")
         ),
-        spec!("view.deleteGuide", "Delete Guide", &[], None, r##"{"orientation":"horizontal|vertical","index":n}"##, has_doc, |s, p| guide_cmd(s, p, "delete")),
-        spec!("view.clearGuides", "Clear Guides", &["View"], None, "{}", has_doc, |s, p| guide_cmd(s, p, "clear")),
+        spec!("view.deleteGuide", "Delete Guide", &[], None, r##"{"orientation":"horizontal|vertical","index":n,"artboard":id?}"##, has_doc, |s, p| guide_cmd(
+            s, p, "delete"
+        )),
+        spec!("view.clearGuides", "Clear Guides", &["View"], None, r##"{"artboard":id?} (omit for document guides)"##, has_doc, |s, p| guide_cmd(
+            s, p, "clear"
+        )),
     ]
 }
 
@@ -1425,6 +1450,72 @@ mod tests {
         let d = &s.active().unwrap().doc;
         assert_eq!(d.layers.len(), 3);
         assert!(d.layers[2].name.ends_with("copy"));
+    }
+
+    #[test]
+    fn layer_via_copy_places_artboards_like_duplicate_and_undoes_atomically() {
+        for cmd in ["layer.new.layerViaCopy", "layer.duplicate"] {
+            for blocked in [false, true] {
+                let mut s = Session::new();
+                s.execute("file.new", json!({"width":40,"height":30,"artboards":true,"background":"transparent"})).unwrap();
+                let source = s.active().unwrap().doc.layers[0].id;
+                let child = s.active().unwrap().doc.layer(source).unwrap().children().unwrap()[0].id;
+                s.select_layer(child).unwrap();
+                s.execute("edit.fill", json!({"color":"#ff0000"})).unwrap();
+                s.select_layer(source).unwrap();
+                s.execute("layer.artboard.set", json!({"x":10,"y":-20})).unwrap();
+                if blocked {
+                    s.execute("layer.new.artboard", json!({"rect":[150,-20,40,30]})).unwrap();
+                    s.select_layer(source).unwrap();
+                }
+                let before = s.active().unwrap().doc.clone();
+                let steps = s.active().unwrap().history.past_len();
+                let copy = LayerId(s.execute(cmd, json!({})).unwrap()["layer"].as_u64().unwrap());
+                let st = s.active().unwrap();
+                let board = st.doc.layer(copy).unwrap();
+                let x = if blocked { 290 } else { 150 };
+                assert_eq!(board.artboard().unwrap().rect, Rect::new(x, -20, x + 40, 10), "{cmd}, blocked={blocked}");
+                let copied_child = &board.children().unwrap()[0];
+                assert_ne!(copied_child.id, child);
+                assert_eq!(copied_child.surface().unwrap().content_bounds(), Rect::new(x, -20, x + 40, 10));
+                assert!(copied_child.surface().unwrap().sample_channel(x + 5, -15, 0) > 0.99);
+                assert_eq!(st.doc.layer(source), before.layer(source));
+                assert_eq!(st.active_layer, Some(copy));
+                assert_eq!(st.history.past_len(), steps + 1);
+                assert!(s.undo());
+                assert_eq!(s.active().unwrap().doc, before);
+                assert_eq!(s.active().unwrap().active_layer, Some(source));
+            }
+        }
+    }
+
+    #[test]
+    fn layer_via_copy_keeps_ordinary_artboard_child_in_place() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width":40,"height":30,"artboards":true,"background":"transparent"})).unwrap();
+        let board = s.active().unwrap().doc.layers[0].id;
+        let child = s.active().unwrap().doc.layer(board).unwrap().children().unwrap()[0].id;
+        s.select_layer(child).unwrap();
+        s.execute("edit.fill", json!({"color":"#ff0000"})).unwrap();
+        let before = s.active().unwrap().doc.clone();
+        let copy = LayerId(s.execute("layer.new.layerViaCopy", json!({})).unwrap()["layer"].as_u64().unwrap());
+        let doc = &s.active().unwrap().doc;
+        assert_eq!(doc.artboards().len(), 1);
+        assert_eq!(doc.layer(board).unwrap().artboard(), before.layer(board).unwrap().artboard());
+        assert_eq!(doc.artboard_of(copy), Some(board));
+        assert_eq!(doc.layer(copy).unwrap().surface(), before.layer(child).unwrap().surface());
+    }
+
+    #[test]
+    fn layer_via_copy_artboard_without_room_preserves_document_and_history() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width":40,"height":30})).unwrap();
+        s.execute("layer.new.artboard", json!({"rect":[i32::MAX-40,0,40,30]})).unwrap();
+        let before = s.active().unwrap().doc.clone();
+        let steps = s.active().unwrap().history.past_len();
+        assert!(s.execute("layer.new.layerViaCopy", json!({})).is_err());
+        assert_eq!(s.active().unwrap().doc, before);
+        assert_eq!(s.active().unwrap().history.past_len(), steps);
     }
 
     /// #1096: Layer via Copy and Cut deselect, as Photoshop does, so a following Free Transform

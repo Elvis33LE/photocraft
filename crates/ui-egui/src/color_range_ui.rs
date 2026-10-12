@@ -14,7 +14,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use egui::{Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
-use photocraft_doc::{DocId, Document};
+use photocraft_doc::{DocId, Document, LayerId};
+use photocraft_geom::Rect as DocRect;
 use serde_json::{Map, Value, json};
 
 use crate::PhotocraftApp;
@@ -166,6 +167,11 @@ pub fn confirm(app: &mut PhotocraftApp, f: &Map<String, Value>) -> Result<Value,
 pub struct Preview {
     doc: DocId,
     revision: u64,
+    active_layer: Option<LayerId>,
+    bounds: DocRect,
+    /// The current editing area translated to (0, 0), shared by both preview sizes.
+    source: Arc<Document>,
+    source_error: Option<String>,
     /// Proxy scale: proxy pixel = `k` document pixels.
     k: u32,
     proxy: Arc<Document>,
@@ -220,6 +226,7 @@ fn scope_preview(proxy: &Document, params: &Value, mask: &mut [f32]) {
 /// session (Out Of Gamut uses the document's own proof setup).
 fn proxy_mask(app: &PhotocraftApp, proxy: &Document, k: u32, params: &Value) -> Result<Vec<f32>, String> {
     let area = proxy.bounds();
+    let origin = app.session.active().map(|d| d.doc.editing_bounds(d.active_layer)).unwrap_or_default();
     if params.get("select").and_then(Value::as_str).unwrap_or("sampledColors") == "sampledColors" {
         // Pick on the original document, not the thumbnail's nearest retained pixel. The
         // prepared Lab query is the same one the command uses at full resolution.
@@ -268,7 +275,10 @@ fn proxy_mask(app: &PhotocraftApp, proxy: &Document, k: u32, params: &Value) -> 
                         [x, y] => Some([x.as_f64()?, y.as_f64()?]),
                         _ => None,
                     }) {
-                        *v = json!([(x / f64::from(k)).floor().clamp(0.0, w - 1.0), (y / f64::from(k)).floor().clamp(0.0, h - 1.0)]);
+                        *v = json!([
+                            ((x - f64::from(origin.x0)) / f64::from(k)).floor().clamp(0.0, w - 1.0),
+                            ((y - f64::from(origin.y0)) / f64::from(k)).floor().clamp(0.0, h - 1.0)
+                        ]);
                     }
                 }
             }
@@ -300,17 +310,40 @@ fn report(app: &mut PhotocraftApp, error: Option<String>) {
 /// Refresh the cached proxy / textures for the active document and the dialog's params. Returns
 /// (texture to show, its size in proxy pixels, k).
 fn preview(app: &mut PhotocraftApp, ctx: &egui::Context, f: &Map<String, Value>) -> Option<(egui::TextureId, [usize; 2], u32)> {
-    let (doc_id, revision, doc) = {
+    let (doc_id, revision, active_layer, bounds, doc) = {
         let st = app.session.active()?;
-        (st.doc.id, st.revision, st.doc.clone())
+        (st.doc.id, st.revision, st.active_layer, st.doc.editing_bounds(st.active_layer), st.doc.clone())
     };
-    if !matches!(&app.color_range, Some(p) if p.doc == doc_id && p.revision == revision) {
-        let side = doc.size.width.max(doc.size.height).max(1);
+    if !matches!(&app.color_range, Some(p) if p.doc == doc_id && p.revision == revision && p.active_layer == active_layer && p.bounds == bounds) {
+        let source = match active_layer.and_then(|id| doc.artboard_of(id)) {
+            Some(board) => photocraft_engine::artboard_export::frame_document(&doc, board, true).map_err(|e| e.to_string()).map(|mut one| {
+                // Export extraction makes a selected board visible; selection previews
+                // must retain its canvas visibility, just like the engine's samples.
+                if let Some(layer) = one.layer_mut(board) {
+                    layer.visible = doc.layer(board).is_some_and(|l| l.visible);
+                }
+                Arc::new(one)
+            }),
+            None => Ok(doc.clone()),
+        };
+        let (source, source_error) = match source {
+            Ok(source) => (source, None),
+            Err(e) => {
+                let mut empty = Document::new(doc.name.clone(), photocraft_doc::Size::new(1, 1), doc.mode, doc.depth);
+                empty.id = doc.id;
+                (Arc::new(empty), Some(e))
+            }
+        };
+        let side = source.size.width.max(source.size.height).max(1);
         let k = side.div_ceil(PREVIEW).max(1);
-        let proxy = Arc::new(crate::proxy::proxy_document(&doc, k));
+        let proxy = Arc::new(crate::proxy::proxy_document(&source, k));
         app.color_range = Some(Preview {
             doc: doc_id,
             revision,
+            active_layer,
+            bounds,
+            source,
+            source_error,
             k,
             proxy,
             image: None,
@@ -321,6 +354,10 @@ fn preview(app: &mut PhotocraftApp, ctx: &egui::Context, f: &Map<String, Value>)
             overlay: None,
             overlay_key: 0,
         });
+    }
+    if let Some(error) = app.color_range.as_ref().and_then(|p| p.source_error.clone()) {
+        report(app, Some(error));
+        return None;
     }
     let image_view = (s(f, "__view", "selection") == "image") ^ ctx.input(|i| i.modifiers.command || (!cfg!(target_os = "macos") && i.modifiers.ctrl));
     let params = params(f);
@@ -486,9 +523,10 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Valu
             let sample =
                 ui.input(|i| (clicked && i.pointer.primary_pressed()) || (held && (i.pointer.primary_pressed() || i.pointer.delta() != egui::Vec2::ZERO)));
             if let Some(p) = resp.interact_pointer_pos().filter(|p| c.sampling && sample && img_rect.contains(*p)) {
+                let origin = app.color_range.as_ref().map(|p| p.bounds).unwrap_or_default();
                 let at = [
-                    ((p.x - img_rect.left()) / scale).floor().max(0.0) as f64 * f64::from(k) + f64::from(k / 2),
-                    ((p.y - img_rect.top()) / scale).floor().max(0.0) as f64 * f64::from(k) + f64::from(k / 2),
+                    f64::from(origin.x0) + ((p.x - img_rect.left()) / scale).floor().max(0.0) as f64 * f64::from(k) + f64::from(k / 2),
+                    f64::from(origin.y0) + ((p.y - img_rect.top()) / scale).floor().max(0.0) as f64 * f64::from(k) + f64::from(k / 2),
                 ];
                 pick(app, f, at, ui.input(|i| i.modifiers));
             }
@@ -595,8 +633,11 @@ pub(crate) fn paint_selection_preview(app: &mut PhotocraftApp, ctx: &egui::Conte
     }
     // Refresh the document/revision cache before borrowing its canvas proxy.
     let _ = preview(app, ctx, &fields);
+    if app.color_range.as_ref().is_none_or(|p| p.source_error.is_some()) {
+        return;
+    }
     if app.color_range.as_ref().is_some_and(|p| p.canvas_proxy.is_none()) {
-        let Some(original) = app.session.active().map(|st| st.doc.clone()) else { return };
+        let Some(original) = app.color_range.as_ref().map(|p| p.source.clone()) else { return };
         let k = original.size.width.max(original.size.height).max(1).div_ceil(CANVAS_PREVIEW);
         let proxy = Arc::new(crate::proxy::proxy_document(&original, k));
         if let Some(p) = app.color_range.as_mut() {
@@ -641,11 +682,18 @@ fn sampling_top(app: &PhotocraftApp) -> Option<Map<String, Value>> {
 /// on the image does in Photoshop. Returns whether it picked.
 pub fn pick_top(app: &mut PhotocraftApp, at: [f64; 2], mods: egui::Modifiers) -> bool {
     let Some(mut f) = sampling_top(app) else { return false };
-    let Some(doc) = app.session.active().map(|st| &st.doc) else { return false };
-    if !at[0].is_finite() || !at[1].is_finite() || at[0] < 0.0 || at[1] < 0.0 || at[0] >= f64::from(doc.size.width) || at[1] >= f64::from(doc.size.height) {
+    let Some(st) = app.session.active() else { return false };
+    let bounds = st.doc.editing_bounds(st.active_layer);
+    if !at[0].is_finite()
+        || !at[1].is_finite()
+        || at[0] < f64::from(bounds.x0)
+        || at[1] < f64::from(bounds.y0)
+        || at[0] >= f64::from(bounds.x1)
+        || at[1] >= f64::from(bounds.y1)
+    {
         return false;
     }
-    if doc.selection.as_ref().is_some_and(|selection| selection.sample_channel(at[0].floor() as i32, at[1].floor() as i32, 0) <= 0.0) {
+    if st.doc.selection.as_ref().is_some_and(|selection| selection.sample_channel(at[0].floor() as i32, at[1].floor() as i32, 0) <= 0.0) {
         return false;
     }
     pick(app, &mut f, at, mods);
@@ -701,9 +749,12 @@ pub fn canvas_eyedropper(app: &mut PhotocraftApp, ctx: &egui::Context, over: egu
 /// + one (or Shift) adds one, the − one (or Alt) subtracts one.
 pub fn pick(app: &PhotocraftApp, f: &mut Map<String, Value>, at: [f64; 2], mods: egui::Modifiers) {
     let Some(st) = app.session.active() else { return };
-    let (w, h) = (f64::from(st.doc.size.width.max(1)), f64::from(st.doc.size.height.max(1)));
+    let bounds = st.doc.editing_bounds(st.active_layer);
+    if bounds.is_empty() || !at.iter().all(|v| v.is_finite()) {
+        return;
+    }
     let [x, y] = at;
-    let at = [x.floor().clamp(0.0, w - 1.0), y.floor().clamp(0.0, h - 1.0)];
+    let at = [x.floor().clamp(f64::from(bounds.x0), f64::from(bounds.x1) - 1.0), y.floor().clamp(f64::from(bounds.y0), f64::from(bounds.y1) - 1.0)];
     if st.doc.selection.as_ref().is_some_and(|selection| selection.sample_channel(at[0] as i32, at[1] as i32, 0) <= 0.0) {
         return;
     }
@@ -766,6 +817,164 @@ mod tests {
         let mut s = photocraft_engine::Session::new();
         s.add_document(doc, None);
         PhotocraftApp::new(s, crate::Services::default())
+    }
+
+    fn app_with_offset_board(origin: [i32; 2]) -> (PhotocraftApp, LayerId) {
+        let mut app = app_with_doc();
+        app.run("layer.new.layerFromBackground", json!({})).unwrap();
+        let id = LayerId(app.run("layer.new.artboardFromLayers", json!({"name":"Colors"})).unwrap()["layer"].as_u64().unwrap());
+        app.run("layer.artboard.set", json!({"layer":id.0,"x":origin[0],"y":origin[1]})).unwrap();
+        (app, id)
+    }
+
+    #[test]
+    fn offset_board_canvas_pick_localized_preview_and_ok_share_coordinates() {
+        for origin in [[-334, -131], [334, 131]] {
+            let (mut app, _) = app_with_offset_board(origin);
+            let id = open(&mut app);
+            let at = [f64::from(origin[0] + 30), f64::from(origin[1] + 5)];
+            assert!(pick_top(&mut app, at, egui::Modifiers::NONE));
+            assert!(!pick_top(&mut app, [f64::from(origin[0] - 1), at[1]], egui::Modifiers::NONE));
+            let mut f = app.ui.dialog_mut(id).unwrap().fields.clone();
+            assert_eq!(points(&f, "points"), [at]);
+            f.insert("localized".into(), json!(true));
+            f.insert("range".into(), json!(20));
+            f.insert("fuzziness".into(), json!(0));
+            let ctx = egui::Context::default();
+            assert!(preview(&mut app, &ctx, &f).is_some());
+            let cached = app.color_range.as_ref().unwrap();
+            assert_eq!(cached.bounds, GRect::from_xywh(origin[0], origin[1], 40, 30));
+            assert_eq!(cached.proxy.size, Size::new(40, 30));
+            let shown = proxy_mask(&app, &cached.proxy, cached.k, &params(&f)).unwrap();
+            confirm(&mut app, &f).unwrap();
+            for (x, y) in [(30, 5), (25, 5), (39, 14), (5, 5), (5, 22)] {
+                assert_eq!(shown[y * 40 + x], coverage(&app, origin[0] + x as i32, origin[1] + y as i32), "origin={origin:?} local=({x},{y})");
+            }
+            assert_eq!(coverage(&app, origin[0] + 30, origin[1] + 5), 1.0);
+        }
+    }
+
+    #[test]
+    fn overlapping_board_preview_and_ok_match_composite_and_active_child_samples() {
+        for origin in [[-334, -131], [334, 131]] {
+            for all_layers in [true, false] {
+                let (mut app, target) = app_with_offset_board(origin);
+                let child = app.session.active().unwrap().doc.layer(target).unwrap().children().unwrap()[0].id;
+                app.run("layer.new.artboard", json!({"rect":[origin[0]+20,origin[1],20,15],"background":"black"})).unwrap();
+                app.session.select_layer(child).unwrap();
+                let id = open(&mut app);
+                let mut f = app.ui.dialog_mut(id).unwrap().fields.clone();
+                f.insert("points".into(), json!([[origin[0] + 5, origin[1] + 20]]));
+                f.insert("fuzziness".into(), json!(0));
+                preview(&mut app, &egui::Context::default(), &f).unwrap();
+                let cache = app.color_range.as_ref().unwrap();
+                assert_eq!(cache.source.layers.len(), 2);
+                assert!(cache.proxy.layer(child).is_some());
+                let mut p = params(&f);
+                p["sampleAllLayers"] = json!(all_layers);
+                let shown = proxy_mask(&app, &cache.proxy, cache.k, &p).unwrap();
+                app.run(COMMAND, p).unwrap();
+                for y in 0..30 {
+                    for x in 0..40 {
+                        assert_eq!(
+                            shown[y * 40 + x],
+                            coverage(&app, origin[0] + x as i32, origin[1] + y as i32),
+                            "origin={origin:?} all_layers={all_layers} local=({x},{y})"
+                        );
+                    }
+                }
+                assert_eq!(coverage(&app, origin[0] + 30, origin[1] + 5), if all_layers { 1.0 } else { 0.0 });
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_board_gamut_preview_matches_proof_and_hidden_target_selection() {
+        for origin in [[-334, -131], [334, 131]] {
+            for hidden in [false, true] {
+                let (mut app, target) = app_with_offset_board(origin);
+                let child = app.session.active().unwrap().doc.layer(target).unwrap().children().unwrap()[0].id;
+                app.run("layer.new.artboard", json!({"rect":[origin[0],origin[1]+15,20,15],"background":"transparent"})).unwrap();
+                // The overlapping board replaces the target's black pixels: saturated blue is
+                // outside the default CMYK proof, while mid grey remains reproducible.
+                app.run("shape.create", json!({"rect":[origin[0],origin[1]+15,10,15],"fill":"#0000ff"})).unwrap();
+                app.run("shape.create", json!({"rect":[origin[0]+10,origin[1]+15,10,15],"fill":"#808080"})).unwrap();
+                if hidden {
+                    app.run("layer.hideLayers", json!({"layer":target.0})).unwrap();
+                }
+                app.session.select_layer(child).unwrap();
+                for srgb_proof in [false, true] {
+                    if srgb_proof {
+                        app.run("view.proofSetup", json!({"profile":"srgb"})).unwrap();
+                    }
+                    let id = open(&mut app);
+                    let mut f = app.ui.dialog_mut(id).unwrap().fields.clone();
+                    f.insert("select".into(), json!("outOfGamut"));
+                    preview(&mut app, &egui::Context::default(), &f).unwrap();
+                    let cache = app.color_range.as_ref().unwrap();
+                    assert_eq!(cache.source.layer(target).unwrap().visible, !hidden);
+                    let shown = proxy_mask(&app, &cache.proxy, cache.k, &params(&f)).unwrap();
+                    confirm(&mut app, &f).unwrap();
+                    for y in 0..30 {
+                        for x in 0..40 {
+                            assert_eq!(
+                                shown[y * 40 + x],
+                                coverage(&app, origin[0] + x as i32, origin[1] + y as i32),
+                                "origin={origin:?} hidden={hidden} srgb_proof={srgb_proof} local=({x},{y})"
+                            );
+                        }
+                    }
+                    assert_eq!(coverage(&app, origin[0] + 5, origin[1] + 25), if srgb_proof { 0.0 } else { 1.0 });
+                    assert_eq!(coverage(&app, origin[0] + 15, origin[1] + 25), 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offset_board_thumbnail_pick_preserves_global_points() {
+        for origin in [[-334, -131], [334, 131]] {
+            let (app, _) = app_with_offset_board(origin);
+            let mut h = harness(app);
+            open(h.state_mut());
+            h.run_steps(4);
+            let point = h.get_by_label("Color Range preview").rect().left_top() + vec2(30.0 * 5.0 + 2.5, 25.0 + 5.0 * 5.0 + 2.5);
+            click(&mut h, point);
+            h.run_steps(2);
+            let f = h.state().ui.dialogs.last().unwrap().fields.clone();
+            assert_eq!(points(&f, "points"), [[f64::from(origin[0] + 30), f64::from(origin[1] + 5)]]);
+            let cached = h.state().color_range.as_ref().unwrap();
+            assert!(cached.error.is_none(), "{:?}", cached.error);
+            let shown = proxy_mask(h.state(), &cached.proxy, cached.k, &params(&f)).unwrap();
+            confirm(h.state_mut(), &f).unwrap();
+            assert_eq!(shown[5 * 40 + 30], coverage(h.state(), origin[0] + 30, origin[1] + 5));
+        }
+    }
+
+    #[test]
+    fn active_board_change_invalidates_proxy_without_document_edit() {
+        let (mut app, first) = app_with_offset_board([-334, -131]);
+        let second = LayerId(app.run("layer.new.artboard", json!({"rect":[334,131,31,19],"background":"black"})).unwrap()["layer"].as_u64().unwrap());
+        app.session.select_layer(first).unwrap();
+        let id = open(&mut app);
+        let f = app.ui.dialog_mut(id).unwrap().fields.clone();
+        let ctx = egui::Context::default();
+        preview(&mut app, &ctx, &f).unwrap();
+        let old = app.color_range.as_ref().unwrap().proxy.clone();
+        let revision = app.session.active().unwrap().revision;
+        // Session::select_layer also bumps the view revision. Keep it fixed here to verify
+        // that the preview's active-layer/bounds cache key independently invalidates a proxy.
+        let st = app.session.active_mut().unwrap();
+        st.active_layer = Some(second);
+        st.selected_layers = vec![second];
+        st.layer_anchor = Some(second);
+        assert_eq!(app.session.active().unwrap().revision, revision);
+        preview(&mut app, &ctx, &f).unwrap();
+        let cache = app.color_range.as_ref().unwrap();
+        assert_eq!(cache.active_layer, Some(second));
+        assert_eq!(cache.proxy.size, Size::new(31, 19));
+        assert_eq!(cache.bounds, GRect::new(334, 131, 365, 150));
+        assert!(!Arc::ptr_eq(&old, &cache.proxy));
     }
 
     fn coverage(app: &PhotocraftApp, x: i32, y: i32) -> f32 {
