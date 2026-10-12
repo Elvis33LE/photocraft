@@ -122,7 +122,7 @@ pub fn parse_artboard(data: &[u8]) -> Option<Artboard> {
 
 /// Resource 1032 order, shared by its writer and the artboard index mapper. Coincident guides
 /// remain distinct: a document guide and an owned guide must never acquire the other's owner.
-pub(crate) fn psd_guides(doc: &Document) -> Vec<(f32, u8, Option<LayerId>)> {
+pub(crate) fn psd_guides(doc: &Document) -> Vec<(f64, u8, Option<LayerId>)> {
     let boards = doc.artboards();
     let mut out = Vec::new();
     for vertical in [true, false] {
@@ -149,7 +149,7 @@ pub(crate) fn import_artboard_guides(doc: &mut Document, resource: Option<&[u8]>
     let mut warnings = Vec::new();
     let Some(data) = resource else { return warnings };
     let Some(count) = data.get(12..16).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_be_bytes) else { return warnings };
-    let lines: Vec<(f32, u8)> = data
+    let lines: Vec<(f64, u8)> = data
         .get(16..)
         .unwrap_or_default()
         .as_chunks::<5>()
@@ -158,7 +158,7 @@ pub(crate) fn import_artboard_guides(doc: &mut Document, resource: Option<&[u8]>
         .take(count as usize)
         .filter_map(|b| {
             let bytes = <[u8; 4]>::try_from(b.get(..4)?).ok()?;
-            Some((i32::from_be_bytes(bytes) as f32 / 32.0, *b.get(4)?))
+            Some((f64::from(i32::from_be_bytes(bytes)) / 32.0, *b.get(4)?))
         })
         .collect();
     let mut claimed = vec![false; lines.len()];

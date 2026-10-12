@@ -682,7 +682,8 @@ fn sampling_top(app: &PhotocraftApp) -> Option<Map<String, Value>> {
 /// on the image does in Photoshop. Returns whether it picked.
 pub fn pick_top(app: &mut PhotocraftApp, at: [f64; 2], mods: egui::Modifiers) -> bool {
     let Some(mut f) = sampling_top(app) else { return false };
-    let Some(bounds) = app.session.active().map(|st| st.doc.editing_bounds(st.active_layer)) else { return false };
+    let Some(st) = app.session.active() else { return false };
+    let bounds = st.doc.editing_bounds(st.active_layer);
     if !at[0].is_finite()
         || !at[1].is_finite()
         || at[0] < f64::from(bounds.x0)
@@ -692,7 +693,7 @@ pub fn pick_top(app: &mut PhotocraftApp, at: [f64; 2], mods: egui::Modifiers) ->
     {
         return false;
     }
-    if doc.selection.as_ref().is_some_and(|selection| selection.sample_channel(at[0].floor() as i32, at[1].floor() as i32, 0) <= 0.0) {
+    if st.doc.selection.as_ref().is_some_and(|selection| selection.sample_channel(at[0].floor() as i32, at[1].floor() as i32, 0) <= 0.0) {
         return false;
     }
     pick(app, &mut f, at, mods);

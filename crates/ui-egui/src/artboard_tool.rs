@@ -410,6 +410,26 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) ->
     true
 }
 
+pub fn cursor(app: &PhotocraftApp, p: [f64; 2]) -> Option<egui::CursorIcon> {
+    let xf = ViewXform::active(app)?;
+    let doc = app.session.active()?;
+    let selected = doc.active_layer?;
+    let layer = doc.doc.layer(selected)?;
+    let board = layer.artboard()?;
+    let point = xf.to_screen(p[0] as f32, p[1] as f32);
+    let rect = board.rect;
+    let index = handles([f64::from(rect.x0), f64::from(rect.y0), f64::from(rect.x1), f64::from(rect.y1)])
+        .iter()
+        .position(|h| xf.to_screen(h[0] as f32, h[1] as f32).distance(point) <= 7.0)?;
+    let (hx, hy) = [( -1, -1), (0, -1), (1,-1), (1,0),(1,1),(0,1),(-1,1),(-1,0)][index];
+    Some(match (hx, hy) {
+        (0, _) => egui::CursorIcon::ResizeVertical,
+        (_, 0) => egui::CursorIcon::ResizeHorizontal,
+        _ if hx == hy => egui::CursorIcon::ResizeNwSe,
+        _ => egui::CursorIcon::ResizeNeSw,
+    })
+}
+
 fn update(g: &mut Gesture, p: [f64; 2], shift: bool) {
     if !p.iter().all(|v| v.is_finite()) {
         return;
@@ -640,6 +660,14 @@ pub fn options(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         }
     }
     ui.label(tl!("Drag to create, move or resize; Alt/Option + plus copies contents"));
+}
+
+pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bool {
+    if tool != Tool::Artboard {
+        return false;
+    }
+    options(app, ui);
+    true
 }
 
 #[cfg(test)]

@@ -7,13 +7,12 @@
 //! `layer.translate`) moves the board with its contents. The canvas grows to fit every board,
 //! in every direction, like Photoshop's auto-expanding artboard canvas ([`fit_canvas`]).
 
-use photocraft_color::{Color, ColorMode, PixelFormat, SampleType};
+use photocraft_color::Color;
 use photocraft_doc::responsive::{
     Anchor, Dimensions, HorizontalAnchor, LayerLayoutRule, ResizeMode, StackAlignment, StackDirection, StackRule, TextFlow, VerticalAnchor,
 };
 use photocraft_doc::{Artboard, ArtboardBackground, Document, Layer, LayerContent, LayerId, Size};
 use photocraft_geom::{Affine, Rect};
-use photocraft_raster::Surface;
 use serde_json::{Value, json};
 
 const MAX_ARTBOARD_DIAGNOSTICS: usize = 1_000;
@@ -1306,7 +1305,7 @@ fn add_beside(s: &mut Session, p: &Value) -> Result<Value> {
             nid
         } else {
             let mut g = Layer::group(next_artboard_name(doc), vec![]);
-            set_artboard(&mut g, Artboard { rect, background: src.background, preset: src.preset.clone() });
+            set_artboard(&mut g, Artboard { rect, background: src.background, preset: src.preset.clone(), guides: src.guides.clone() });
             doc.insert_above(Some(id), g)
         };
         fit_canvas(doc);

@@ -1146,8 +1146,6 @@ pub struct UiState {
     /// Frame tool (see `frame_tool`).
     #[serde(default)]
     pub frame_tool: crate::frame_tool::FrameToolUi,
-    /// Artboard tool (see `artboard_tool`).
-    pub artboard_tool: crate::artboard_tool::ArtboardToolUi,
     /// Modifier Keys panel, custom pixel aspect ratios, workspace dialogs (see `workspace_ui`).
     #[serde(default)]
     pub shell: crate::workspace_ui::ShellUi,
@@ -1290,7 +1288,6 @@ impl Default for UiState {
             timeline: Default::default(),
             slices: Default::default(),
             frame_tool: Default::default(),
-            artboard_tool: Default::default(),
             shell: Default::default(),
             layer_filter: Vec::new(),
             pen: None,

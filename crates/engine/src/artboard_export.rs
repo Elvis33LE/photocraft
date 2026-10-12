@@ -256,6 +256,7 @@ pub fn to_files(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = selected(doc, p)?;
     let variants = variants(p)?;
     validate_output_count(ids.len(), variants.len())?;
+    let save = crate::file_cmds::SaveOpts::from_params(s, p, "file.export.artboardsToFiles")?;
     let ext = p.get("format").and_then(Value::as_str).unwrap_or("png").to_ascii_lowercase();
     if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "psd" | "psb" | "pcraft" | "tif" | "tiff" | "webp" | "bmp" | "tga" | "gif" | "exr" | "qoi") {
         return Err(bad("unsupported artboard export format"));
@@ -279,7 +280,7 @@ pub fn to_files(s: &mut Session, p: &Value) -> Result<Value> {
     let mut warnings = Vec::new();
     for (id, scale, path) in plans {
         let opts = variant_options(p, scale)?;
-        let result = document(doc, id, &opts).and_then(|one| crate::file_cmds::save_doc(&one, &path, crate::file_cmds::SaveOpts::from_params(p)));
+        let result = document(doc, id, &opts).and_then(|one| crate::file_cmds::save_doc(&one, &path, save));
         match result {
             Ok(w) => {
                 files.push(path);

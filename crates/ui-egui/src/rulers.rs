@@ -196,9 +196,9 @@ pub fn draw_guides(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform,
                     }
                     let r = board.rect;
                     let (a, b) = if vertical {
-                        (xf.to_screen(*pos, r.y0 as f32), xf.to_screen(*pos, r.y1 as f32))
+                        (xf.to_screen(*pos as f32, r.y0 as f32), xf.to_screen(*pos as f32, r.y1 as f32))
                     } else {
-                        (xf.to_screen(r.x0 as f32, *pos), xf.to_screen(r.x1 as f32, *pos))
+                        (xf.to_screen(r.x0 as f32, *pos as f32), xf.to_screen(r.x1 as f32, *pos as f32))
                     };
                     styled_line(&p, a, b, Stroke::new(1.0, guide), style);
                 }

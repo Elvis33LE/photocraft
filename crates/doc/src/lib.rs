@@ -766,10 +766,10 @@ impl Guides {
     /// Moves guides with their owning artboard; document guides stay in place.
     pub fn translate(&mut self, dx: i32, dy: i32) {
         for x in &mut self.vertical {
-            *x += dx as f32;
+            *x += f64::from(dx);
         }
         for y in &mut self.horizontal {
-            *y += dy as f32;
+            *y += f64::from(dy);
         }
     }
 
