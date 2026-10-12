@@ -1858,7 +1858,8 @@ fn deep_merge_refuses_dropped_compositing() {
         s.execute("layer.select", json!({"layer": l, "mode": "add"})).unwrap();
     }
     let err = s.execute("layer.mergeLayers", json!({})).unwrap_err().to_string();
-    assert!(err.contains("opacity") && err.contains("Flatten"), "{err}");}
+    assert!(err.contains("opacity") && err.contains("Flatten"), "{err}");
+}
 
 
 /// #4535: every edit snapshots the document into history. The large payloads it carries (the
