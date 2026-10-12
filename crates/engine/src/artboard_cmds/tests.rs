@@ -1,4 +1,5 @@
 use super::*;
+use crate::file_cmds::join;
 use photocraft_geom::Rect;
 use proptest::prelude::*;
 
@@ -105,6 +106,258 @@ fn session(depth: u32) -> Session {
     let mut s = Session::new();
     s.execute("file.new", json!({"width": 100, "height": 80, "depth": depth})).unwrap();
     s
+}
+
+#[test]
+fn new_artboard_document_is_atomic_and_depth_agnostic() {
+    for depth in [8, 16, 32] {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 345, "height": 360, "depth": depth, "artboards":true, "background":"transparent"})).unwrap();
+        assert_eq!(doc(&s).layers.len(), 1);
+        let board = &doc(&s).layers[0];
+        assert_eq!(board.artboard().unwrap().rect, Rect::new(0, 0, 345, 360));
+        assert_eq!(board.children().unwrap().len(), 1);
+        assert!(matches!(board.artboard().unwrap().background, ArtboardBackground::Transparent));
+        assert_eq!(s.active().unwrap().history.past_len(), 0);
+        let count = s.documents().len();
+        assert!(s.execute("file.new", json!({"artboards":"yes"})).is_err());
+        assert_eq!(s.documents().len(), count);
+    }
+}
+
+#[test]
+fn adjacent_boards_support_all_directions_and_one_step_copy() {
+    for (direction, rect) in [
+        ("left", Rect::new(-130, 10, -90, 50)),
+        ("right", Rect::new(150, 10, 190, 50)),
+        ("up", Rect::new(10, -130, 50, -90)),
+        ("down", Rect::new(10, 150, 50, 190)),
+    ] {
+        let mut s = session(16);
+        let source = board_with_square(&mut s);
+        s.edit("owned guides", |d, _| {
+            d.layer_mut(source).unwrap().artboard_mut().unwrap().guides.vertical.push(15.0);
+            Ok(())
+        })
+        .unwrap();
+        let past = s.active().unwrap().history.past_len();
+        let result = s.execute("layer.new.artboard", json!({"adjacentTo":source.0,"direction":direction,"duplicate":true})).unwrap();
+        let copy = LayerId(result["layer"].as_u64().unwrap());
+        assert_eq!(board_rect(&s, copy.0), rect);
+        assert_ne!(doc(&s).layer(copy).unwrap().children().unwrap()[0].id, doc(&s).layer(source).unwrap().children().unwrap()[0].id);
+        let dx = rect.x0 - 10;
+        assert_eq!(doc(&s).layer(copy).unwrap().artboard().unwrap().guides.vertical, vec![15.0 + dx as f32]);
+        assert_eq!(s.active().unwrap().history.past_len(), past + 1);
+        assert!(s.undo());
+        assert!(doc(&s).layer(copy).is_none());
+        assert!(s.redo());
+        assert_eq!(board_rect(&s, copy.0), rect);
+    }
+}
+
+#[test]
+fn board_resize_keeps_children_and_position_lock_does_not_lock_children() {
+    let mut s = session(8);
+    let board = board_with_square(&mut s);
+    let child = doc(&s).layer(board).unwrap().children().unwrap()[0].id;
+    s.execute("layer.artboard.set", json!({"rect":[-20,-10,100,90],"moveContents":false})).unwrap();
+    assert_eq!(doc(&s).layer(child).unwrap().surface().unwrap().content_bounds(), Rect::new(10, 10, 30, 30));
+    s.execute("layer.setProps", json!({"layer":board.0,"locks":{"position":true}})).unwrap();
+    assert_rejected(&mut s, "layer.artboard.set", json!({"x":-21}));
+    s.execute("layer.translate", json!({"layer":child.0,"dx":3,"dy":4})).unwrap();
+    assert_eq!(doc(&s).layer(child).unwrap().surface().unwrap().content_bounds(), Rect::new(13, 14, 33, 34));
+}
+
+#[test]
+fn artboard_reparent_and_grouping_are_rejected_without_mutation() {
+    let mut s = session(8);
+    let board = board_with_square(&mut s);
+    let other = s.execute("layer.new.artboard", json!({"rect":[100,100,40,40]})).unwrap()["layer"].as_u64().unwrap();
+    for copy in [false, true] {
+        assert_rejected(&mut s, "layer.moveTo", json!({"layer":board.0,"target":other,"position":"into","copy":copy}));
+    }
+    s.select_layer(board).unwrap();
+    let before = doc(&s).clone();
+    assert!(s.execute("layer.groupLayers", json!({})).is_err());
+    assert_eq!(doc(&s), &before);
+}
+
+#[test]
+fn automatic_nesting_is_atomic_and_honours_anti_nesting() {
+    let mut s = session(8);
+    let board = board_with_square(&mut s);
+    let child = doc(&s).layer(board).unwrap().children().unwrap()[0].id;
+    let other = LayerId(s.execute("layer.new.artboard", json!({"rect":[100,100,40,40]})).unwrap()["layer"].as_u64().unwrap());
+    let past = s.active().unwrap().history.past_len();
+    s.execute("layer.translate", json!({"layer":child.0,"dx":100,"dy":100,"autoNest":true,"drop":[115,115]})).unwrap();
+    assert_eq!(doc(&s).artboard_of(child), Some(other));
+    assert_eq!(s.active().unwrap().history.past_len(), past + 1);
+    s.undo();
+    assert_eq!(doc(&s).artboard_of(child), Some(board));
+    s.execute("layer.setProps", json!({"layer":child.0,"locks":{"artboard":true}})).unwrap();
+    s.execute("layer.translate", json!({"layer":child.0,"dx":100,"dy":100,"autoNest":true,"drop":[115,115]})).unwrap();
+    assert_eq!(doc(&s).artboard_of(child), Some(board));
+}
+
+#[test]
+fn automatic_nesting_skips_hidden_overlapping_boards() {
+    let mut s = session(8);
+    let source = board_with_square(&mut s);
+    let child = doc(&s).layer(source).unwrap().children().unwrap()[0].id;
+    let lower = s.execute("layer.new.artboard", json!({"rect":[100,100,40,40]})).unwrap()["layer"].as_u64().unwrap();
+    let upper = s.execute("layer.new.artboard", json!({"rect":[100,100,40,40]})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.setProps", json!({"layer":upper,"visible":false})).unwrap();
+    s.execute("layer.translate", json!({"layer":child.0,"dx":100,"dy":100,"autoNest":true,"drop":[115,115]})).unwrap();
+    assert_eq!(doc(&s).artboard_of(child), Some(LayerId(lower)));
+    assert!(red_at(&s, 115, 115));
+}
+
+#[test]
+fn negative_artboard_shapes_survive_create_resize_move_preview_and_export() {
+    for depth in [8, 16, 32] {
+        let mut s = session(depth);
+        let board =
+            LayerId(s.execute("layer.new.artboard", json!({"rect":[-1000,-1000,100,100],"background":"transparent"})).unwrap()["layer"].as_u64().unwrap());
+        let shape = s.execute("shape.create", json!({"kind":"rect","rect":[-990,-990,300,20],"fill":"#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.moveTo", json!({"layer":shape,"target":board.0,"position":"into"})).unwrap();
+        assert!(red_at(&s, -985, -985), "depth {depth}: created");
+        assert!(!red_at(&s, -750, -985));
+        let preview = preview_rect(doc(&s), board, Rect::new(-1000, -1000, -600, -900), false).unwrap();
+        assert!(photocraft_compose::render(&preview, Rect::from_xywh(-750, -985, 1, 1)).px[0][0] > 0.99);
+        s.execute("layer.artboard.set", json!({"layer":board.0,"width":400,"moveContents":false})).unwrap();
+        assert!(red_at(&s, -750, -985), "depth {depth}: resize reveals model");
+        s.execute("layer.translate", json!({"layer":board.0,"dx":-500,"dy":-500})).unwrap();
+        assert!(red_at(&s, -1250, -1485), "depth {depth}: negative move");
+        let extracted = artboard_document(doc(&s), board).unwrap().unwrap();
+        let pixel = photocraft_compose::render(&extracted, Rect::from_xywh(250, 15, 1, 1)).px[0];
+        assert!(pixel[0] > 0.99 && pixel[1] < 0.01 && pixel[3] > 0.99, "depth {depth}: export {pixel:?}");
+        s.undo();
+        assert!(red_at(&s, -750, -985));
+    }
+}
+
+#[test]
+fn shape_creation_on_an_empty_active_artboard_owns_and_renders_the_child() {
+    let mut s = session(8);
+    let board = LayerId(s.execute("layer.new.artboard", json!({"rect":[-100,-100,100,100]})).unwrap()["layer"].as_u64().unwrap());
+    let shape = LayerId(s.execute("shape.create", json!({"kind":"rect","rect":[-90,-90,20,20],"fill":"#ff0000"})).unwrap()["layer"].as_u64().unwrap());
+    assert_eq!(doc(&s).artboard_of(shape), Some(board));
+    assert!(red_at(&s, -80, -80));
+    s.undo();
+    assert!(doc(&s).layer(board).unwrap().children().unwrap().is_empty());
+    s.redo();
+    assert_eq!(doc(&s).artboard_of(shape), Some(board));
+    assert!(red_at(&s, -80, -80));
+}
+
+#[test]
+fn selections_sample_and_modify_the_negative_active_artboard() {
+    let mut s = session(8);
+    let board = board_with_square(&mut s);
+    let child = doc(&s).layer(board).unwrap().children().unwrap()[0].id;
+    s.execute("layer.artboard.set", json!({"x":-1000,"y":-1000})).unwrap();
+    s.execute("layer.select", json!({"layer":child.0})).unwrap();
+    s.execute("select.all", json!({})).unwrap();
+    assert_eq!(doc(&s).selection.as_ref().unwrap().content_bounds(), Rect::new(-1000, -1000, -960, -960));
+    s.execute("select.modify.contract", json!({"radius":1,"applyAtCanvasBounds":true})).unwrap();
+    assert_eq!(doc(&s).selection.as_ref().unwrap().content_bounds(), Rect::new(-999, -999, -961, -961));
+    s.execute("select.magicWand", json!({"x":-995,"y":-995,"antiAlias":false,"tolerance":0})).unwrap();
+    assert_eq!(doc(&s).selection.as_ref().unwrap().content_bounds(), Rect::new(-1000, -1000, -980, -980));
+    s.execute("select.colorRange", json!({"points":[[-995,-995]],"fuzziness":0})).unwrap();
+    assert_eq!(doc(&s).selection.as_ref().unwrap().content_bounds(), Rect::new(-1000, -1000, -980, -980));
+    s.execute("select.rect", json!({"x":-1001,"y":-1001,"width":12,"height":12})).unwrap();
+    assert_eq!(doc(&s).selection.as_ref().unwrap().content_bounds(), Rect::new(-1000, -1000, -989, -989));
+    s.execute("select.inverse", json!({})).unwrap();
+    assert_eq!(doc(&s).selection.as_ref().unwrap().content_bounds(), Rect::new(-1000, -1000, -960, -960));
+}
+
+#[test]
+fn dissolving_last_negative_board_preserves_content_and_guides() {
+    let mut s = session(32);
+    let board = board_with_square(&mut s);
+    s.execute("layer.artboard.set", json!({"x":-40,"y":-40})).unwrap();
+    s.edit("guides", |d, _| {
+        d.layer_mut(board).unwrap().artboard_mut().unwrap().guides.vertical.push(-35.0);
+        Ok(())
+    })
+    .unwrap();
+    let before = doc(&s).clone();
+    s.execute("layer.ungroupLayers", json!({"layer":board.0})).unwrap();
+    assert!(!doc(&s).has_artboards());
+    assert_eq!(doc(&s).guides.vertical, vec![5.0]);
+    assert!(red_at(&s, 5, 5));
+    s.undo();
+    assert_eq!(doc(&s), &before);
+}
+
+#[test]
+fn malformed_artboard_properties_and_overflow_leave_history_unchanged() {
+    let mut s = session(8);
+    let board = board_with_square(&mut s);
+    for params in [
+        json!({"rect":[0,0,20,20,"extra"]}),
+        json!({"width":"20"}),
+        json!({"layer":"wrong"}),
+        json!({"moveContents":"false"}),
+        json!({"width":300001}),
+        json!({"x":false}),
+    ] {
+        assert_rejected(&mut s, "layer.artboard.set", params);
+    }
+    for params in
+        [json!({"adjacentTo":board.0,"direction":"diagonal"}), json!({"adjacentTo":board.0,"direction":false}), json!({"adjacentTo":board.0,"duplicate":"yes"})]
+    {
+        assert_rejected(&mut s, "layer.new.artboard", params);
+    }
+    s.execute("layer.artboard.set", json!({"x":i32::MAX-40,"moveContents":false})).unwrap();
+    assert_rejected(&mut s, "layer.translate", json!({"dx":1,"dy":0}));
+    assert_rejected(&mut s, "layer.new.artboard", json!({"adjacentTo":board.0}));
+}
+
+#[test]
+fn artboard_preview_is_pure_and_matches_move_or_resize_commit() {
+    let mut s = session(16);
+    let board = board_with_square(&mut s);
+    let before = doc(&s).clone();
+    let past = s.active().unwrap().history.past_len();
+    let moved = preview_rect(doc(&s), board, Rect::new(50, 60, 90, 100), true).unwrap();
+    let resized = preview_rect(doc(&s), board, Rect::new(-20, -30, 90, 100), false).unwrap();
+    assert_eq!(doc(&s), &before);
+    assert_eq!(s.active().unwrap().history.past_len(), past);
+    let child = before.layer(board).unwrap().children().unwrap()[0].id;
+    assert_eq!(resized.layer(child).unwrap().surface().unwrap().content_bounds(), before.layer(child).unwrap().surface().unwrap().content_bounds());
+    s.execute("layer.artboard.set", json!({"layer":board.0,"rect":[50,60,40,40]})).unwrap();
+    assert_eq!(moved.layer(child).unwrap().surface().unwrap(), doc(&s).layer(child).unwrap().surface().unwrap());
+    assert_eq!(moved.layer(board).unwrap().artboard(), doc(&s).layer(board).unwrap().artboard());
+}
+
+#[test]
+fn creating_board_within_canvas_keeps_pixel_damage_and_redo_selection() {
+    let mut s = session(8);
+    let result = s.execute("layer.new.artboard", json!({"rect":[10,10,20,20],"background":"black"})).unwrap();
+    let id = LayerId(result["layer"].as_u64().unwrap());
+    assert_ne!(s.active().unwrap().last_damage, Some(Rect::EMPTY));
+    assert_eq!(s.active().unwrap().selected_layers(), vec![id]);
+    s.undo();
+    s.redo();
+    assert_eq!(s.active().unwrap().selected_layers(), vec![id]);
+}
+
+#[test]
+fn child_free_transform_ignores_board_position_lock_but_keeps_all_lock() {
+    let mut s = session(8);
+    let board = board_with_square(&mut s);
+    let child = doc(&s).layer(board).unwrap().children().unwrap()[0].id;
+    s.execute("layer.setProps", json!({"layer":board.0,"locks":{"position":true}})).unwrap();
+    assert!(!crate::transform_cmds::locked_for_transform(doc(&s), child));
+    assert!(crate::transform_cmds::locked_for_transform(doc(&s), board));
+    s.execute("edit.transform", json!({"layer":child.0,"matrix":[1,0,0,1,3,4],"interpolation":"nearest"})).unwrap();
+    assert_eq!(doc(&s).layer(child).unwrap().surface().unwrap().content_bounds(), Rect::new(13, 14, 33, 34));
+    s.execute("layer.setProps", json!({"layer":board.0,"locks":{"all":true}})).unwrap();
+    assert!(crate::transform_cmds::locked_for_transform(doc(&s), child));
+    let before = doc(&s).clone();
+    assert!(s.execute("edit.transform", json!({"layer":child.0,"matrix":[1,0,0,1,3,4]})).is_err());
+    assert_eq!(doc(&s), &before);
 }
 
 fn doc(s: &Session) -> &Document {
@@ -812,26 +1065,21 @@ fn from_layers_and_group_then_compose_clips() {
 }
 
 #[test]
-fn clear_artboard_guides_only_inside() {
+fn clear_artboard_guides_only_owned() {
     let mut s = session(8);
-    s.execute("layer.new.artboard", json!({"rect": [0, 0, 50, 50]})).unwrap();
-    s.edit("guides", |d, _| {
-        d.guides.vertical = vec![10.0, 70.0];
-        d.guides.horizontal = vec![20.0];
-        Ok(())
-    })
-    .unwrap();
+    let board = s.execute("layer.new.artboard", json!({"rect": [0, 0, 50, 50]})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("view.newGuide", json!({"orientation": "vertical", "position": 10})).unwrap();
+    s.execute("view.newGuide", json!({"artboard": board, "orientation": "vertical", "position": 10})).unwrap();
+    // An owned guide outside the resized board retains ownership.
+    s.execute("view.newGuide", json!({"artboard": board, "orientation": "horizontal", "position": 70})).unwrap();
     assert_eq!(s.execute("view.clearSelectedArtboardGuides", json!({})).unwrap()["cleared"], 2);
-    assert_eq!(doc(&s).guides.vertical, vec![70.0]);
-    assert!(doc(&s).guides.horizontal.is_empty());
-    // Clear Canvas Guides leaves the artboard's guides.
-    s.edit("guides", |d, _| {
-        d.guides.vertical = vec![10.0, 70.0];
-        Ok(())
-    })
-    .unwrap();
-    assert_eq!(s.execute("view.clearCanvasGuides", json!({})).unwrap()["cleared"], 1);
     assert_eq!(doc(&s).guides.vertical, vec![10.0]);
+    assert!(doc(&s).layer(LayerId(board)).unwrap().artboard().unwrap().guides.horizontal.is_empty());
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(doc(&s).layer(LayerId(board)).unwrap().artboard().unwrap().guides.horizontal, vec![70.0]);
+    assert_eq!(s.execute("view.clearCanvasGuides", json!({})).unwrap()["cleared"], 1);
+    assert!(doc(&s).guides.vertical.is_empty());
+    assert_eq!(doc(&s).layer(LayerId(board)).unwrap().artboard().unwrap().guides.vertical, vec![10.0]);
 }
 
 /// Clearing guides drops their colours, so a guide added later at the same place doesn't inherit one.

@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 
 use crate::PhotocraftApp;
 use crate::canvas::ViewXform;
-use crate::theme::Tokens;
+use crate::props_layout::{LABEL_GAP, LABEL_W, field_width};
+use crate::theme::{self, Tokens};
 
 fn safe_area_bounds(board: photocraft_geom::Rect, insets: photocraft_doc::responsive::SafeInsets) -> photocraft_geom::Rect {
     let fraction = |value: f32| f64::from(value.clamp(0.0, 0.5));
@@ -22,7 +23,12 @@ fn safe_area_bounds(board: photocraft_geom::Rect, insets: photocraft_doc::respon
 /// Screen rects covering the document image minus every artboard (vertical slabs between the
 /// boards' x edges, split around the boards they cross).
 pub fn pasteboard_rects(xf: &ViewXform, doc: &Document) -> Vec<Rect> {
-    let canvas = doc.bounds();
+    pasteboard_regions(doc).into_iter().map(|r| xf.doc_rect(r)).collect()
+}
+
+/// Document-space pieces of the pasteboard, kept unrotated until the painter maps their corners.
+pub(crate) fn pasteboard_regions(doc: &Document) -> Vec<photocraft_geom::Rect> {
+    let canvas = doc.artboards().iter().fold(doc.bounds(), |r, b| r.union(&b.2.rect));
     let boards: Vec<photocraft_geom::Rect> = doc.artboards().iter().map(|b| b.2.rect.intersect(&canvas)).filter(|r| !r.is_empty()).collect();
     let mut xs: Vec<i32> = vec![canvas.x0, canvas.x1];
     for b in &boards {
@@ -38,28 +44,33 @@ pub fn pasteboard_rects(xf: &ViewXform, doc: &Document) -> Vec<Rect> {
         let mut y = canvas.y0;
         for (a, b) in spans {
             if a > y {
-                out.push(xf.doc_rect(photocraft_geom::Rect::new(x0, y, x1, a)));
+                out.push(photocraft_geom::Rect::new(x0, y, x1, a));
             }
             y = y.max(b);
         }
         if y < canvas.y1 {
-            out.push(xf.doc_rect(photocraft_geom::Rect::new(x0, y, x1, canvas.y1)));
+            out.push(photocraft_geom::Rect::new(x0, y, x1, canvas.y1));
         }
     }
     out
 }
 
 /// Board outlines and names (the active board's name is highlighted, as in Photoshop).
-pub fn draw_frames(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform) {
+pub fn draw_frames(app: &PhotocraftApp, doc: &Document, painter: &egui::Painter, xf: &ViewXform) {
     let Some(st) = app.session.active() else { return };
     let t = Tokens::get(painter.ctx());
     let active = st.active_layer.and_then(|id| st.doc.artboard_of(id));
-    for (id, name, a) in st.doc.artboards() {
+    for (id, name, a) in doc.artboards() {
+        if doc.layer(id).is_none_or(|l| !l.visible) {
+            continue;
+        }
         let r = xf.doc_rect(a.rect);
         let on = active == Some(id);
         painter.rect_stroke(r, 0.0, Stroke::new(1.0, if on { t.accent } else { Color32::from_black_alpha(90) }), egui::StrokeKind::Outside);
         let pos = Pos2::new(r.left(), r.top() - 4.0);
-        painter.text(pos, Align2::LEFT_BOTTOM, name, egui::FontId::proportional(11.0), if on { t.text } else { t.text_dim });
+        if !app.ui.hide_artboard_names {
+            painter.text(pos, Align2::LEFT_BOTTOM, name, egui::FontId::proportional(11.0), if on { t.text } else { t.text_dim });
+        }
         if app.ui.extras.safe_areas {
             for safe_area in st.doc.responsive.safe_areas.iter().filter(|area| area.artboard == id) {
                 let safe = xf.doc_rect(safe_area_bounds(a.rect, safe_area.insets));
@@ -130,50 +141,112 @@ pub fn properties(app: &mut PhotocraftApp, ui: &mut egui::Ui, layer: &Layer) {
     // The custom background swatch was clicked: its colour, for the Color Picker.
     let mut pick: Option<[f32; 3]> = None;
     ui.label(egui::RichText::new(tl!("Artboard")).font(crate::theme::semibold(12.0)).color(t.text));
-    ui.add_space(4.0);
+    ui.add_space(theme::ROW_GAP);
     let mut preset = a.preset.clone();
     let mut opts: Vec<(String, &str)> = vec![(String::new(), tl!("Custom"))];
     opts.extend(photocraft_engine::artboard_cmds::PRESETS.iter().map(|(n, _, _)| (n.to_string(), *n)));
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(tl!("Size")).color(t.text_dim).size(12.0));
-        if crate::widgets::dropdown(ui, &key("preset"), &mut preset, &opts, 150.0) && !preset.is_empty() {
-            edit = Some(json!({"layer": layer.id.0, "preset": preset}));
-        }
-    });
+    ui.label(egui::RichText::new(tl!("Size")).color(t.text_dim).size(12.0));
+    if crate::widgets::dropdown(ui, &key("preset"), &mut preset, &opts, ui.available_width()) && !preset.is_empty() {
+        edit = Some(json!({"layer": layer.id.0, "preset": preset}));
+    }
+    let ppi = app.session.active().map_or(72.0, |s| s.doc.resolution_dpi).max(1.0);
+    if app.ui.artboard_unit.is_empty() {
+        app.ui.artboard_unit = "px".to_string();
+    }
+    let mut unit = app.ui.artboard_unit.clone();
+    let opts: Vec<(String, &str)> = crate::new_doc_ui::UNITS.iter().map(|u| (u.0.to_string(), tl!(u.1))).collect();
+    if crate::widgets::dropdown(ui, &key("unit"), &mut unit, &opts, ui.available_width()) {
+        app.ui.artboard_unit = unit.clone();
+    }
+    ui.add_space(theme::ROW_GAP * 3.0);
+    let link_w = 20.0;
+    let number_w = field_width(ui.available_width() - link_w, 2, LABEL_W);
     let num = |ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>| -> bool {
-        ui.label(egui::RichText::new(tl!(&label)).color(t.text_dim).size(12.0));
-        crate::widgets::value_field(ui, v, range, "px", 64.0).changed()
+        let (label_rect, label_response) = ui.allocate_exact_size(egui::vec2(LABEL_W, 24.0), egui::Sense::hover());
+        ui.painter().text(label_rect.right_center() - egui::vec2(2.0, 0.0), Align2::RIGHT_CENTER, tl!(label), egui::FontId::proportional(12.0), t.text_dim);
+        label_response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), tl!(label)));
+        let mut shown = crate::new_doc_ui::to_unit(*v, &unit, ppi);
+        let range = crate::new_doc_ui::to_unit(*range.start(), &unit, ppi)..=crate::new_doc_ui::to_unit(*range.end(), &unit, ppi);
+        let changed = crate::widgets::value_field_prec(ui, &mut shown, range, &unit, number_w, crate::widgets::unit_decimals(&unit))
+            .labelled_by(label_response.id)
+            .changed();
+        if changed {
+            *v = crate::new_doc_ui::from_unit(shown, &unit, ppi);
+        }
+        changed
     };
     let r = a.rect;
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = LABEL_GAP;
         let (mut w, mut h) = (r.width() as f32, r.height() as f32);
         let cw = num(ui, "W", &mut w, 1.0..=300_000.0);
+        if crate::icons::button(
+            ui,
+            if app.ui.artboard_proportions { "link" } else { "unlink" },
+            link_w,
+            app.ui.artboard_proportions,
+            tl!("Constrain proportions"),
+        )
+        .clicked()
+        {
+            app.ui.artboard_proportions = !app.ui.artboard_proportions;
+        }
         let ch = num(ui, "H", &mut h, 1.0..=300_000.0);
         if cw || ch {
+            if app.ui.artboard_proportions {
+                if cw {
+                    h = (w * r.height() as f32 / r.width().max(1) as f32).round().clamp(1.0, 300_000.0);
+                } else {
+                    w = (h * r.width() as f32 / r.height().max(1) as f32).round().clamp(1.0, 300_000.0);
+                }
+            }
             edit = Some(json!({"layer": layer.id.0, "width": w.round(), "height": h.round(), "coalesce": key("wh")}));
         }
     });
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = LABEL_GAP;
+        ui.label(egui::RichText::new(tl!("Orientation")).color(t.text_dim).size(12.0));
+        for (icon, portrait) in [("rectangle-vertical", true), ("rectangle-horizontal", false)] {
+            if crate::icons::button_with_icon_size(
+                ui,
+                icon,
+                26.0,
+                18.0,
+                (r.height() > r.width()) == portrait,
+                if portrait { tl!("Portrait") } else { tl!("Landscape") },
+            )
+            .clicked()
+                && (r.height() > r.width()) != portrait
+            {
+                edit = Some(json!({"layer":layer.id.0,"width":r.height(),"height":r.width()}));
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = LABEL_GAP;
         let (mut x, mut y) = (r.x0 as f32, r.y0 as f32);
         let cx = num(ui, "X", &mut x, -300_000.0..=300_000.0);
+        ui.allocate_space(egui::vec2(link_w, 24.0));
         let cy = num(ui, "Y", &mut y, -300_000.0..=300_000.0);
         if cx || cy {
             edit = Some(json!({"layer": layer.id.0, "x": x.round(), "y": y.round(), "coalesce": key("xy")}));
         }
     });
-    ui.add_space(4.0);
+    ui.add_space(theme::ROW_GAP * 3.0);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(tl!("Artboard Background Color")).color(t.text_dim).size(12.0));
     });
     ui.horizontal(|ui| {
         let mut bg = a.background.name().to_string();
+        let width = ui.available_width()
+            - if matches!(a.background, ArtboardBackground::Custom(_)) { ui.spacing().interact_size.x + ui.spacing().item_spacing.x } else { 0.0 };
         let opts = [
             ("white".to_string(), tl!("White")),
             ("black".to_string(), tl!("Black")),
             ("transparent".to_string(), tl!("Transparent")),
             ("custom".to_string(), tl!("Other…")),
         ];
-        if crate::widgets::dropdown(ui, &key("bg"), &mut bg, &opts, 120.0) {
+        if crate::widgets::dropdown(ui, &key("bg"), &mut bg, &opts, width) {
             let mut params = json!({"layer": layer.id.0, "background": bg});
             if bg == "custom" {
                 let hex = match a.background {

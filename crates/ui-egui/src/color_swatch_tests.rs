@@ -31,8 +31,9 @@ fn harness(setup: impl FnOnce(&mut PhotocraftApp) + 'static) -> Harness<'static,
 fn pick(h: &mut Harness<'_, PhotocraftApp>, label: &str) -> String {
     // Panels scroll: bring the swatch into view first.
     h.get_by_role_and_label(Role::ColorWell, label).scroll_to_me();
-    h.run_steps(2);
-    h.get_by_role_and_label(Role::ColorWell, label).click_accesskit();
+    // The properties panel can grow beyond its dock; let animated scrolling finish.
+    h.run_steps(6);
+    h.get_by_role_and_label(Role::ColorWell, label).click();
     answer(h, label)
 }
 

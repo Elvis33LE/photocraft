@@ -943,6 +943,31 @@ fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
     let fmt = serde_json::to_value(prefs.quick_export_format).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "png".into());
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let doc = d.doc.clone();
+    if doc.has_artboards() {
+        let dir = match p.get("dir").and_then(Value::as_str).filter(|v| !v.is_empty()) {
+            Some(dir) => dir.to_string(),
+            None if serde_json::to_value(prefs.quick_export_location).ok().is_some_and(|v| v == "sameFolder") => {
+                let saved = d.path.as_deref().ok_or_else(|| bad(cmd, "save the document or provide dir for artboard Quick Export"))?;
+                std::path::Path::new(saved).parent().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()
+            }
+            None => return Err(bad(cmd, "artboard Quick Export needs dir (a folder); path is reserved for a single image")),
+        };
+        let mut params = p.clone();
+        if !params.is_object() {
+            params = json!({});
+        }
+        params["dir"] = json!(dir);
+        params["format"] = json!(fmt);
+        params["convertToSrgb"] = json!(prefs.convert_to_srgb);
+        params["metadata"] = serde_json::to_value(prefs.metadata).unwrap_or(json!("none"));
+        if fmt == "jpg" || (fmt == "webp" && !prefs.webp_lossless) {
+            let quality = if fmt == "jpg" { prefs.jpeg_quality } else { prefs.webp_quality };
+            params["quality"] = json!((f64::from(quality.clamp(1, 100)) - 1.0) * 12.0 / 99.0);
+        }
+        let result = crate::artboard_export::to_files(s, &params)?;
+        crate::automate_cmds::fire_event(s, "export");
+        return Ok(result);
+    }
     let path = match p.get("path").and_then(Value::as_str).filter(|v| !v.is_empty()) {
         Some(v) => v.to_string(),
         None => {
@@ -1396,7 +1421,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Quick Export",
             &[],
             None,
-            r##"{"path":str? (required unless Export Preferences › Location is "sameFolder" and the document is saved)} → {path, format, bytes}"##,
+            r##"{"path":str? (single image),"dir":folder? (artboard documents),"artboards":[id]? (all by default)} (target required unless Location="sameFolder" and document saved) → {path,format,bytes}|{files,warnings} (full frame per artboard)"##,
             native_doc,
             quick_export
         ),

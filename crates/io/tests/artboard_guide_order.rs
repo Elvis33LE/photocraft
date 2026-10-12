@@ -31,10 +31,11 @@ fn doc_with_board(rect: Rect) -> Document {
     a.surface_mut().unwrap().fill_rect(Rect::new(1, 1, 2, 2), &[1.0, 0.0, 0.0, 1.0]);
     let mut g1 = Layer::group("Board", vec![a]);
     if let LayerContent::Group(g) = &mut g1.content {
-        g.artboard = Some(Artboard { rect, background: ArtboardBackground::White, preset: String::new() });
+        g.artboard = Some(Artboard { rect, background: ArtboardBackground::White, preset: String::new(), guides: Default::default() });
+        g.artboard.as_mut().unwrap().guides.vertical.push(20.0);
     }
     d.layers = vec![g1];
-    d.guides = Guides { horizontal: vec![90.0], vertical: vec![20.0], ..Default::default() };
+    d.guides = Guides { horizontal: vec![90.0], vertical: Vec::new() };
     d
 }
 

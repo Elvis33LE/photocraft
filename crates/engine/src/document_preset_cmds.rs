@@ -78,6 +78,7 @@ pub(crate) fn validate_new_params(s: &Session, p: &Value) -> Result<()> {
                 continue;
             }
             "name" => (value.is_string(), "a string".into()),
+            "artboards" => (value.is_boolean(), "a boolean".into()),
             _ => return Err(bad(cmd, format!("unknown parameter `{key}`"))),
         };
         if !valid {
@@ -101,6 +102,8 @@ pub struct DocumentSettings {
     pub background: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_color: Option<[f32; 3]>,
+    #[serde(default)]
+    pub artboards: bool,
     /// Display units only; width/height are always pixels and resolution is always ppi.
     pub unit: String,
     pub resolution_unit: String,
@@ -166,7 +169,7 @@ impl DocumentSettings {
     /// Creation params deliberately exclude both the preset name and display-only units.
     pub fn command_params(&self) -> Value {
         let mut p = json!({"width":self.width,"height":self.height,"resolution":self.resolution,
-            "mode":self.mode,"depth":self.depth,"background":self.background});
+            "mode":self.mode,"depth":self.depth,"background":self.background,"artboards":self.artboards});
         if let Some(c) = self.background_color {
             p["backgroundColor"] = json!(c);
         }
@@ -345,7 +348,7 @@ mod tests {
 
     fn settings() -> Value {
         json!({"width":16,"height":24,"resolution":254.5,"mode":"lab","depth":16,
-            "background":"backgroundColor","backgroundColor":[0.125,0.375,0.625],"unit":"mm","resolutionUnit":"cm"})
+            "background":"backgroundColor","backgroundColor":[0.125,0.375,0.625],"artboards":false,"unit":"mm","resolutionUnit":"cm"})
     }
 
     fn saved(s: &mut Session, name: &str, settings: Value) -> Value {
@@ -386,6 +389,30 @@ mod tests {
                 assert_eq!(doc.mode, color_mode(mode).unwrap());
                 assert_eq!(doc.depth, sample_type(depth).unwrap());
             }
+        }
+    }
+
+    #[test]
+    fn artboard_setting_survives_saved_presets_and_legacy_defaults() {
+        for artboards in [false, true] {
+            let mut s = Session::new();
+            let mut config = settings();
+            config["artboards"] = json!(artboards);
+            let preset = saved(&mut s, "Boards", config);
+            let mut next = reload(&s);
+            assert_eq!(next.presets.documents[0].settings.artboards, artboards);
+            let result = next.execute("document.presets.get", json!({"name":"Boards"})).unwrap();
+            assert_eq!(result["preset"], preset);
+            assert_eq!(result["params"]["artboards"], artboards);
+            next.execute("file.new", result["params"].clone()).unwrap();
+            assert_eq!(next.active().unwrap().doc.has_artboards(), artboards);
+            let mut legacy = serde_json::to_value(&s.presets.documents[0]).unwrap();
+            legacy["settings"].as_object_mut().unwrap().remove("artboards");
+            let decoded: DocumentPreset = serde_json::from_value(legacy).unwrap();
+            assert!(!decoded.settings.artboards);
+            let before = s.prefs_value();
+            assert!(s.execute("document.presets.save", json!({"name":"Wrong","settings":{"width":16,"height":24,"artboards":"yes"}})).is_err());
+            assert_eq!(s.prefs_value(), before);
         }
     }
 

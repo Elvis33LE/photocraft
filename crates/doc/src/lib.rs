@@ -762,6 +762,24 @@ impl Guides {
     }
 }
 
+impl Guides {
+    /// Moves guides with their owning artboard; document guides stay in place.
+    pub fn translate(&mut self, dx: i32, dy: i32) {
+        for x in &mut self.vertical {
+            *x += dx as f32;
+        }
+        for y in &mut self.horizontal {
+            *y += dy as f32;
+        }
+    }
+
+    /// Transfers ownership when an artboard is dissolved, preserving coincident guides.
+    pub fn extend(&mut self, other: &Self) {
+        self.horizontal.extend_from_slice(&other.horizontal);
+        self.vertical.extend_from_slice(&other.vertical);
+    }
+}
+
 /// Which areas an alpha channel's overlay colour marks (Channel Options › Color Indicates).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -949,6 +967,12 @@ impl Document {
         Rect::from_size(self.size)
     }
 
+    /// Pixel operations on an artboard child use its owning frame, including negative
+    /// workspace coordinates. Root layers and ordinary documents use the document canvas.
+    pub fn editing_bounds(&self, active: Option<LayerId>) -> Rect {
+        active.and_then(|id| self.artboard_of(id)).and_then(|id| self.layer(id)).and_then(|l| l.artboard()).map_or_else(|| self.bounds(), |a| a.rect)
+    }
+
     /// Nesting depth of the deepest layer: 0 for a root-level layer, 1 inside one group, and so
     /// on. Computed over an explicit stack, so it cannot overflow on any tree it measures.
     pub fn max_group_depth(&self) -> usize {
@@ -1007,9 +1031,16 @@ impl Document {
     }
 
     /// The locks in force on the layer at `path`: its own and those of every group around it,
-    /// since locking a group locks its contents.
+    /// since locking a group locks its contents. An artboard's position lock protects its
+    /// frame, while its children can still move independently.
     pub fn locks_at(&self, path: &[usize]) -> Locks {
-        (1..=path.len()).filter_map(|n| self.layer_at(path.get(..n)?)).fold(Locks::default(), |a, l| a.union(l.locks))
+        (1..=path.len()).filter_map(|n| self.layer_at(path.get(..n)?).map(|l| (n, l))).fold(Locks::default(), |a, (n, l)| {
+            let mut locks = l.locks;
+            if n < path.len() && l.artboard().is_some() {
+                locks.position = false;
+            }
+            a.union(locks)
+        })
     }
 
     /// [`Self::locks_at`] for the layer `id`.
@@ -1079,9 +1110,17 @@ impl Document {
         Some((p.children_mut()?, last))
     }
 
-    /// Insert `layer` directly above the layer `above` (or at the top of the root if None).
+    /// Insert `layer` directly above `above` (or at the root's top if None). An active
+    /// artboard receives ordinary layers inside its container; new artboards stay siblings.
     pub fn insert_above(&mut self, above: Option<LayerId>, layer: Layer) -> LayerId {
         let id = layer.id;
+        if layer.artboard().is_none()
+            && let Some(board) = above.and_then(|a| self.layer_mut(a)).filter(|l| l.artboard().is_some())
+            && let Some(children) = board.children_mut()
+        {
+            children.push(layer);
+            return id;
+        }
         match above.and_then(|a| self.path_of(a)).and_then(|path| self.siblings_mut(&path)) {
             Some((sib, idx)) => sib.insert(idx + 1, layer),
             None => self.layers.push(layer),
@@ -1312,6 +1351,28 @@ mod tests {
         assert!(k.position && k.pixels && !k.all);
         assert!(!d.effective_locks(gid).pixels, "a child's lock doesn't lock its group");
         assert_eq!(d.effective_locks(LayerId(u64::MAX)), Locks::default());
+    }
+
+    #[test]
+    fn active_artboard_receives_new_content_but_artboards_remain_root_siblings() {
+        let mut d = doc();
+        let mut board = Layer::group("Board", vec![]);
+        if let LayerContent::Group(g) = &mut board.content {
+            g.artboard = Some(Artboard {
+                rect: Rect::new(-100, -80, 0, 0),
+                background: ArtboardBackground::Transparent,
+                preset: String::new(),
+                guides: Guides::default(),
+            });
+        }
+        let id = d.insert_above(None, board.clone());
+        let child = d.insert_above(Some(id), Layer::raster("Inside", PixelFormat::RGBA8));
+        assert_eq!(d.artboard_of(child), Some(id));
+        assert_eq!(d.editing_bounds(Some(child)), Rect::new(-100, -80, 0, 0));
+        let sibling = d.insert_above(Some(id), board.duplicate());
+        assert_eq!(d.path_of(sibling).unwrap().len(), 1);
+        assert_eq!(d.layer(id).unwrap().children().unwrap().len(), 1);
+        assert_eq!(d.editing_bounds(None), d.bounds());
     }
 
     #[test]

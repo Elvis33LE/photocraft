@@ -366,11 +366,15 @@ fn build() -> Vec<CommandSpec> {
             "New…",
             ["File"],
             Some("Cmd+N"),
-            r##"{"width":1..300000=1920,"height":1..300000=1080 (pixel counts are rounded),"mode":"rgb|gray|grayscale|cmyk|lab"="rgb","depth":8|16|32=8,"background":"white|black|backgroundColor|transparent|#rrggbb"="white","backgroundColor":[r,g,b]? (0..1; defaults to toolbox colour),"resolution":1..30000=72 (ppi),"name":str}"##,
+            r##"{"width":1..300000=1920,"height":1..300000=1080 (pixel counts are rounded),"mode":"rgb|gray|grayscale|cmyk|lab"="rgb","depth":8|16|32=8,"background":"white|black|backgroundColor|transparent|#rrggbb"="white","backgroundColor":[r,g,b]? (0..1; defaults to toolbox colour),"resolution":1..30000=72 (ppi),"artboards":bool=false,"name":str}"##,
             always,
             |s, p| {
                 use crate::document_preset_cmds::{MAX_DIMENSION, MAX_RESOLUTION, background_color, color_mode, sample_type};
                 crate::document_preset_cmds::validate_new_params(s, p)?;
+                if p.get("artboards").is_some_and(|v| !v.is_boolean()) {
+                    return Err(EngineError::BadParams { cmd: "file.new".into(), msg: "`artboards` must be boolean".into() });
+                }
+                let artboards = p.get("artboards").and_then(Value::as_bool).unwrap_or(false);
                 // A size given as a float (`512.0`, as JSON from a UI field) is still that size (#254).
                 let px = |k: &str, d: u32| match p.get(k) {
                     Some(v) => v
@@ -385,23 +389,48 @@ fn build() -> Vec<CommandSpec> {
                 let depth = sample_type(p.get("depth").and_then(Value::as_u64).unwrap_or(8)).unwrap_or(SampleType::U8);
                 let name = p.get("name").and_then(Value::as_str).unwrap_or("Untitled").to_string();
                 let res = p.get("resolution").and_then(Value::as_f64).unwrap_or(72.0).clamp(1.0, MAX_RESOLUTION) as f32;
-                let mut doc = match p.get("background").and_then(Value::as_str).unwrap_or("white") {
-                    "backgroundColor" => {
-                        let bgc = background_color(p, s.tools.background, "file.new")?;
-                        Document::with_background(name, Size::new(w, h), mode, depth, Color::rgba(bgc[0], bgc[1], bgc[2], 1.0))
-                    }
-                    "transparent" => {
-                        let mut d = Document::new(name, Size::new(w, h), mode, depth);
-                        d.layers.push(Layer::raster("Layer 1", d.pixel_format()));
-                        d
-                    }
-                    "black" => Document::with_background(name, Size::new(w, h), mode, depth, Color::BLACK),
-                    other => {
-                        let c = parse_hex(other).unwrap_or([1.0; 4]);
-                        Document::with_background(name, Size::new(w, h), mode, depth, Color::rgba(c[0], c[1], c[2], c[3]))
+                let mut doc = if artboards {
+                    Document::new(name, Size::new(w, h), mode, depth)
+                } else {
+                    match p.get("background").and_then(Value::as_str).unwrap_or("white") {
+                        "backgroundColor" => {
+                            let bgc = background_color(p, s.tools.background, "file.new")?;
+                            Document::with_background(name, Size::new(w, h), mode, depth, Color::rgba(bgc[0], bgc[1], bgc[2], 1.0))
+                        }
+                        "transparent" => {
+                            let mut d = Document::new(name, Size::new(w, h), mode, depth);
+                            d.layers.push(Layer::raster("Layer 1", d.pixel_format()));
+                            d
+                        }
+                        "black" => Document::with_background(name, Size::new(w, h), mode, depth, Color::BLACK),
+                        other => {
+                            let c = parse_hex(other).unwrap_or([1.0; 4]);
+                            Document::with_background(name, Size::new(w, h), mode, depth, Color::rgba(c[0], c[1], c[2], c[3]))
+                        }
                     }
                 };
                 doc.resolution_dpi = res;
+                if artboards {
+                    let background = match p.get("background").and_then(Value::as_str).unwrap_or("white") {
+                        "transparent" => photocraft_doc::ArtboardBackground::Transparent,
+                        "black" => photocraft_doc::ArtboardBackground::Black,
+                        "white" => photocraft_doc::ArtboardBackground::White,
+                        "backgroundColor" => {
+                            let c = background_color(p, s.tools.background, "file.new")?;
+                            photocraft_doc::ArtboardBackground::Custom(Color::rgba(c[0], c[1], c[2], 1.0))
+                        }
+                        other => {
+                            let c = parse_hex(other).unwrap_or([1.0; 4]);
+                            photocraft_doc::ArtboardBackground::Custom(Color::rgba(c[0], c[1], c[2], c[3]))
+                        }
+                    };
+                    let child = Layer::raster("Layer 1", doc.pixel_format());
+                    let mut board = Layer::group("Artboard 1", vec![child]);
+                    if let LayerContent::Group(group) = &mut board.content {
+                        group.artboard = Some(photocraft_doc::Artboard { rect: doc.bounds(), background, preset: String::new(), guides: Default::default() });
+                    }
+                    doc.layers = vec![board];
+                }
                 let i = s.add_document(doc, None);
                 Ok(json!({ "document": i }))
             }
@@ -438,16 +467,16 @@ fn build() -> Vec<CommandSpec> {
             }
             s.edit("Clear", |doc, _| {
                 let sel = doc.selection.clone();
-                let area = sel.as_ref().map(|m| m.content_bounds()).unwrap_or(doc.bounds());
+                let area = sel.as_ref().map(|m| m.content_bounds()).unwrap_or_else(|| doc.editing_bounds(Some(id)));
                 crate::edit_cmds::clear_area(doc, id, area, sel.as_ref(), bg)
             })?;
             Ok(Value::Null)
         }),
         // Select
         cmd!("select.all", "All", ["Select"], Some("Cmd+A"), "{}", has_doc, |s, _| {
-            s.edit("Select All", |doc, _| {
+            s.edit("Select All", |doc, active| {
                 let mut m = Surface::new(photocraft_color::PixelFormat::GRAY8);
-                m.fill_rect(doc.bounds(), &[1.0]);
+                m.fill_rect(doc.editing_bounds(*active), &[1.0]);
                 doc.selection = Some(m);
                 Ok(())
             })?;
@@ -461,9 +490,9 @@ fn build() -> Vec<CommandSpec> {
             Ok(Value::Null)
         }),
         cmd!("select.inverse", "Inverse", ["Select"], Some("Cmd+Shift+I"), "{}", has_selection, |s, _| {
-            s.edit("Inverse", |doc, _| {
+            s.edit("Inverse", |doc, active| {
                 let old = doc.selection.take().unwrap_or_else(|| Surface::new(photocraft_color::PixelFormat::GRAY8));
-                let b = doc.bounds();
+                let b = doc.editing_bounds(*active);
                 let data: Vec<f32> = old.read_region(b).into_iter().map(|v| 1.0 - v).collect();
                 let mut m = Surface::new(photocraft_color::PixelFormat::GRAY8);
                 m.write_region(b, &data);
@@ -497,8 +526,8 @@ fn build() -> Vec<CommandSpec> {
                 // Options bar: anti-aliased ellipse edges (4x4 supersampled) and Feather (applied to the new shape only).
                 let aa = p.get("antiAlias").and_then(Value::as_bool).unwrap_or(true);
                 let feather = p.get("feather").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 1000.0) as f32;
-                s.edit(step, |doc, _| {
-                    let area = doc.bounds();
+                s.edit(step, |doc, active| {
+                    let area = doc.editing_bounds(*active);
                     // A marquee dragged past the canvas stops at its edge (Photoshop); the ellipse
                     // keeps the dragged shape and is only cut there.
                     use photocraft_algo::selection as sel;
@@ -878,7 +907,7 @@ fn build() -> Vec<CommandSpec> {
             "Move Layer",
             [],
             None,
-            r##"{"layer":id?,"dx":i32,"dy":i32} (no layer: every selected layer; linked layers follow)"##,
+            r##"{"layer":id?,"dx":i32,"dy":i32,"autoNest":bool=false,"drop":[x,y]? (required for autoNest; topmost board at drop point, anti-autonesting locks preserve parent)} (no layer: every selected layer; linked layers follow)"##,
             has_layer,
             crate::layer_multi_cmds::translate
         ),
@@ -1401,6 +1430,7 @@ pub(crate) fn translate_layer(doc: &Document, l: &mut Layer, dx: i32, dy: i32) {
             // Moving an artboard moves the board with its contents.
             if let Some(a) = &mut g.artboard {
                 a.rect = a.rect.translate(dx, dy);
+                a.guides.translate(dx, dy);
             }
             for c in &mut g.children {
                 translate_layer(doc, c, dx, dy);

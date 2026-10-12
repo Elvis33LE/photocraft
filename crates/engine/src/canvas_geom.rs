@@ -108,6 +108,7 @@ pub(crate) fn transform_layer_geometry(l: &mut Layer, a: &Affine, content: bool,
         LayerContent::Group(g) => {
             if let Some(ab) = &mut g.artboard {
                 ab.rect = map_rect(a, ab.rect);
+                transform_guides(&mut ab.guides, a);
             }
             for c in &mut g.children {
                 transform_layer_geometry(c, a, content, dpi);
@@ -145,8 +146,11 @@ pub(crate) fn transform_doc_marks(doc: &mut Document, a: &Affine) {
     for s in &mut doc.slices.list {
         s.rect = map_rect(a, s.rect);
     }
+    transform_guides(&mut doc.guides, a);
+}
+
+fn transform_guides(g: &mut photocraft_doc::Guides, a: &Affine) {
     let [m0, m1, m2, m3, tx, ty] = a.m;
-    let g = &mut doc.guides;
     if m1.abs() < EPS && m2.abs() < EPS {
         g.horizontal.iter_mut().for_each(|y| *y = m3 * *y + ty);
         g.vertical.iter_mut().for_each(|x| *x = m0 * *x + tx);

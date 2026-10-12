@@ -62,7 +62,7 @@ fn bucket(s: &mut Session, p: &Value) -> Result<Value> {
         None
     };
     let filled = s.edit("Paint Bucket", |doc, active| {
-        let area = doc.bounds();
+        let area = if crate::channel_cmds::is_channel_target(p) { doc.bounds() } else { doc.editing_bounds(*active) };
         let sel = doc.selection.clone();
         let (surf, lock) = crate::channel_cmds::target_surface(doc, *active, p)?;
         let ok = if all && region.is_none() {
@@ -120,7 +120,8 @@ fn gradient(s: &mut Session, p: &Value) -> Result<Value> {
     let dither = b(p, "dither", true); // Photoshop dithers gradients by default (reduces banding).
     s.edit("Gradient", |doc, active| {
         let sel = doc.selection.clone();
-        let area = sel.as_ref().map(|m| m.content_bounds()).filter(|r| !r.is_empty()).unwrap_or_else(|| doc.bounds()).intersect(&doc.bounds());
+        let bounds = if crate::channel_cmds::is_channel_target(p) { doc.bounds() } else { doc.editing_bounds(*active) };
+        let area = sel.as_ref().map(|m| m.content_bounds()).filter(|r| !r.is_empty()).unwrap_or(bounds).intersect(&bounds);
         let (surf, lock) = crate::channel_cmds::target_surface(doc, *active, p)?;
         paint_gradient(surf, area, from, to, shape, &stops, reverse, opacity, blend, dither, sel.as_ref(), lock);
         Ok(())
@@ -364,6 +365,41 @@ mod tests {
         assert_eq!(px(&s, 2, 5)[..3], [1.0, 0.0, 0.0]);
         assert!(px(&s, 10, 5)[1] > 0.4, "outside the selection untouched");
         assert!(s.execute("paint.gradient", json!({"from": [0, 0]})).is_err());
+    }
+
+    #[test]
+    fn negative_artboard_pixel_operations_use_owning_frame_at_every_depth() {
+        for depth in [8, 16, 32] {
+            let mut s = Session::new();
+            s.execute("file.new", json!({"width":20,"height":20,"depth":depth,"artboards":true,"background":"transparent"})).unwrap();
+            let board = s.active().unwrap().doc.layers[0].id;
+            let child = s.active().unwrap().doc.layers[0].children().unwrap()[0].id;
+            s.execute("layer.artboard.set", json!({"layer":board.0,"x":-100,"y":-100})).unwrap();
+            s.select_layer(child).unwrap();
+            let before = (*s.active().unwrap().doc).clone();
+            for (cmd, p) in [
+                ("paint.bucket", json!({"x":-90,"y":-90,"color":"#ff0000","sampleAllLayers":false})),
+                ("paint.bucket", json!({"x":-90,"y":-90,"color":"#ff0000","sampleAllLayers":true})),
+                ("paint.gradient", json!({"from":[-100,-100],"to":[-80,-80],"colors":["#ff0000"],"dither":false})),
+                ("edit.fill", json!({"color":"#ff0000"})),
+            ] {
+                let past = s.active().unwrap().history.past_len();
+                s.execute(cmd, p).unwrap();
+                let surf = s.active().unwrap().doc.layer(child).unwrap().surface().unwrap();
+                assert!(surf.pixel(-90, -90)[0] > 0.99, "{cmd}, depth {depth}");
+                assert!(surf.pixel(-90, -90)[3] > 0.99);
+                assert_eq!(surf.pixel(10, 10)[3], 0.0, "canvas outside board remains untouched");
+                assert_eq!(s.active().unwrap().history.past_len(), past + 1);
+                assert!(s.undo());
+                assert_eq!(*s.active().unwrap().doc, before);
+            }
+            s.execute("edit.fill", json!({"color":"#ff0000"})).unwrap();
+            let filled = (*s.active().unwrap().doc).clone();
+            s.execute("edit.clear", json!({})).unwrap();
+            assert_eq!(s.active().unwrap().doc.layer(child).unwrap().surface().unwrap().pixel(-90, -90)[3], 0.0);
+            assert!(s.undo());
+            assert_eq!(*s.active().unwrap().doc, filled);
+        }
     }
 
     #[test]

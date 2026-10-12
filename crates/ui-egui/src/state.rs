@@ -349,6 +349,7 @@ impl Tool {
     pub fn glyph(self) -> &'static str {
         match self {
             Tool::Move => "✥",
+            Tool::Artboard => "⬚",
             Tool::RectMarquee => "⬚",
             Tool::EllipseMarquee => "◌",
             Tool::Brush => "🖌",
@@ -1023,6 +1024,18 @@ pub struct ColorPanelState {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
     pub tool: Tool,
+    /// Artboard gesture, readable by automation but never restored as a held pointer.
+    #[serde(default, skip_deserializing)]
+    pub artboard_gesture: Option<crate::artboard_tool::Gesture>,
+    /// An automatic camera pan; never restored from settings or exposed as document history.
+    #[serde(skip)]
+    pub artboard_focus: Option<crate::artboard_tool::Focus>,
+    #[serde(default)]
+    pub artboard_proportions: bool,
+    #[serde(default)]
+    pub artboard_unit: String,
+    #[serde(default)]
+    pub hide_artboard_names: bool,
     /// The last tool used in each shortcut group (the tools sharing a key, [`Tool::key`]), at most
     /// one per group: the group's key brings it back, as in Photoshop (#2608).
     #[serde(default)]
@@ -1240,6 +1253,11 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             tool: Tool::Brush,
+            artboard_gesture: None,
+            artboard_focus: None,
+            artboard_proportions: false,
+            artboard_unit: String::new(),
+            hide_artboard_names: false,
             group_tools: Vec::new(),
             recent_files: Vec::new(),
             text_edit: None,
@@ -1391,6 +1409,8 @@ mod tests {
         assert_eq!(Tool::from_name("Convert Point Tool"), Some(Tool::ConvertPoint));
         assert_eq!(Tool::ConvertPoint.key(), 'P', "it shares the Pen's key");
         assert!(!Tool::ConvertPoint.is_brushlike());
+        assert_eq!(Tool::from_name("artboard"), Some(Tool::Artboard));
+        assert_eq!(Tool::Artboard.key(), 'V');
         assert_eq!(Tool::from_name("Remove Tool"), Some(Tool::Remove));
         assert_eq!(Tool::Remove.key(), 'J');
         assert!(Tool::Remove.is_brushlike());

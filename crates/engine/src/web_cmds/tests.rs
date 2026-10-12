@@ -383,6 +383,29 @@ fn export_preferences_drive_quick_export() {
 }
 
 #[test]
+fn artboard_quick_export_fires_one_event_only_after_success() {
+    let dir = tmp("quick_artboard_events");
+    let mut s = session(8);
+    s.execute("layer.new.artboard", json!({"name": "First", "width": 8, "height": 6})).unwrap();
+    s.execute("layer.new.artboard", json!({"name": "Second", "width": 9, "height": 7})).unwrap();
+    s.execute("file.scripts.scriptEventsManager", json!({"add": {"event": "export", "name": "Export marker", "steps": []}})).unwrap();
+    assert!(s.file_menu.event_log.is_empty());
+
+    let result = s.execute("file.export.quickExport", json!({"dir": dir})).unwrap();
+    assert_eq!(result["files"].as_array().unwrap().len(), 2);
+    assert_eq!(s.file_menu.event_log.len(), 1, "one event for the complete export, not one per artboard");
+    assert_eq!(s.file_menu.event_log[0]["event"], "export");
+    assert_eq!(s.file_menu.event_log[0]["binding"], "Export marker");
+
+    let blocked = format!("{dir}/not-a-folder");
+    std::fs::write(&blocked, b"keep").unwrap();
+    assert!(s.execute("file.export.quickExport", json!({"dir": blocked})).is_err());
+    assert!(s.execute("file.export.quickExport", json!({"dir": dir, "artboards": []})).is_err());
+    assert_eq!(s.file_menu.event_log.len(), 1, "failed exports must not fire export events");
+    assert_eq!(std::fs::read(&blocked).unwrap(), b"keep");
+}
+
+#[test]
 fn webp_export_preferences_select_lossless_or_lossy_output() {
     let dir = tmp("quick_webp_quality");
     let mut s = session(8);

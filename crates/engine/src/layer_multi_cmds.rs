@@ -267,7 +267,13 @@ pub(crate) fn with_links(doc: &Document, ids: &[LayerId]) -> Vec<LayerId> {
 /// Move layers by whole pixels the way the Move tool does: pixels, linked masks, type and
 /// vector content (shapes, linked vector masks) all move together.
 pub(crate) fn move_layers(doc: &mut Document, moves: &[(LayerId, i32, i32)]) -> Result<()> {
-    let snapshot = doc.clone();
+    let mut snapshot = doc.clone();
+    for &(id, dx, dy) in moves {
+        if let Some(board) = snapshot.layer_mut(id).and_then(Layer::artboard_mut) {
+            crate::artboard_cmds::validate_translation(board.rect, dx, dy)?;
+            board.rect = board.rect.translate(dx, dy);
+        }
+    }
     for &(id, dx, dy) in moves {
         if dx == 0 && dy == 0 {
             continue;
@@ -277,17 +283,84 @@ pub(crate) fn move_layers(doc: &mut Document, moves: &[(LayerId, i32, i32)]) -> 
         if locks.position || locks.all {
             return Err(EngineError::Other(format!("layer \"{}\" is position-locked", l.name)));
         }
+        if let Some(board) = l.artboard() {
+            crate::artboard_cmds::validate_translation(board.rect, dx, dy)?;
+        }
         crate::commands::translate_layer(&snapshot, l, dx, dy);
         crate::vector_cmds::translate_vectors(&snapshot, l, dx as f64, dy as f64);
     }
     Ok(())
 }
 
+/// Drop-time parent changes preserve document coordinates. Overlapping boards choose the
+/// topmost container; anti-autonesting locks keep the existing parent without cancelling move.
+fn auto_nest_layers(doc: &mut Document, ids: &[LayerId], point: (f64, f64)) -> Result<()> {
+    let target = doc
+        .artboards()
+        .into_iter()
+        .rev()
+        .find(|(id, _, a)| {
+            doc.layer(*id).is_some_and(|l| l.visible)
+                && point.0 >= f64::from(a.rect.x0)
+                && point.0 < f64::from(a.rect.x1)
+                && point.1 >= f64::from(a.rect.y0)
+                && point.1 < f64::from(a.rect.y1)
+        })
+        .map(|(id, _, _)| id);
+    for &id in ids {
+        let layer = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+        if layer.artboard().is_some() {
+            continue;
+        }
+        let source = doc.artboard_of(id);
+        if source == target {
+            continue;
+        }
+        let locks = doc.effective_locks(id);
+        if locks.position || locks.all {
+            return Err(bad("layer.translate", "a source layer is locked"));
+        }
+        let blocked = locks.artboard
+            || target.is_some_and(|t| {
+                let locks = doc.effective_locks(t);
+                locks.artboard || locks.all
+            });
+        if blocked {
+            continue;
+        }
+        // Ordinary groups outside artboards remain intact on a drop outside all boards.
+        if source.is_none() && target.is_none() {
+            continue;
+        }
+        let layer = doc.remove(id).ok_or(EngineError::NoLayer(id))?;
+        match target {
+            Some(t) => doc.layer_mut(t).and_then(Layer::children_mut).ok_or(EngineError::NoLayer(t))?.push(layer),
+            None => doc.layers.push(layer),
+        }
+    }
+    check_group_depth(doc, "Move Layers")
+}
+
 /// `layer.translate`: the explicit layer, or every selected layer, plus their linked layers.
 pub fn translate(s: &mut Session, p: &Value) -> Result<Value> {
     let dx = int_i32("layer.translate", p, "dx")?.unwrap_or(0);
     let dy = int_i32("layer.translate", p, "dy")?.unwrap_or(0);
-    if dx == 0 && dy == 0 {
+    let auto_nest = p.get("autoNest").and_then(Value::as_bool).unwrap_or(false);
+    if p.get("autoNest").is_some_and(|v| !v.is_boolean()) {
+        return Err(bad("layer.translate", "`autoNest` must be boolean"));
+    }
+    let drop = if auto_nest {
+        let a = p
+            .get("drop")
+            .and_then(Value::as_array)
+            .filter(|a| a.len() == 2)
+            .ok_or_else(|| bad("layer.translate", "automatic nesting requires `drop`: [x,y]"))?;
+        let coordinate = |n: usize| a.get(n).and_then(Value::as_f64).filter(|f| f.is_finite() && *f >= f64::from(i32::MIN) && *f <= f64::from(i32::MAX));
+        Some((coordinate(0).ok_or_else(|| bad("layer.translate", "invalid drop x"))?, coordinate(1).ok_or_else(|| bad("layer.translate", "invalid drop y"))?))
+    } else {
+        None
+    };
+    if dx == 0 && dy == 0 && !auto_nest {
         return Ok(Value::Null);
     }
     let roots = match p.get("layer").and_then(Value::as_u64) {
@@ -305,6 +378,9 @@ pub fn translate(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let moves: Vec<_> = ids.iter().map(|&id| (id, dx, dy)).collect();
         move_layers(doc, &moves)?;
+        if let Some(point) = drop {
+            auto_nest_layers(doc, &ids, point)?;
+        }
         // A board moved past any canvas edge grows the canvas, as a new one does (#1531, #3070).
         if ids.iter().any(|id| doc.layer(*id).is_some_and(|l| l.artboard().is_some())) {
             crate::artboard_cmds::fit_canvas(doc);
@@ -312,6 +388,14 @@ pub fn translate(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(ids)
     })?;
     note_damage(s, &before, &ids);
+    if auto_nest
+        && let Some(st) = s.active_mut()
+        && ids.iter().any(|id| before.artboard_of(*id) != st.doc.artboard_of(*id))
+    {
+        // Parent changes can alter clipping chains and pass-through adjustments beyond the
+        // moving pixels. A final drop needs full damage; pointer previews remain bounded.
+        st.last_damage = None;
+    }
     Ok(Value::Null)
 }
 
@@ -327,13 +411,23 @@ pub fn move_targets(doc: &Document, roots: &[LayerId]) -> Vec<LayerId> {
 /// copying the moving pixels only.
 pub fn moved(doc: &Document, ids: &[LayerId], dx: i32, dy: i32) -> Result<Document> {
     let mut out = doc.clone();
+    let mut snapshot = doc.clone();
+    for &id in ids {
+        if let Some(board) = snapshot.layer_mut(id).and_then(Layer::artboard_mut) {
+            crate::artboard_cmds::validate_translation(board.rect, dx, dy)?;
+            board.rect = board.rect.translate(dx, dy);
+        }
+    }
     for &id in ids {
         let locks = doc.effective_locks(id);
         let l = out.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
         if locks.position || locks.all {
             return Err(EngineError::Other(format!("layer \"{}\" is position-locked", l.name)));
         }
-        shift_shown(doc, l, dx, dy);
+        if let Some(board) = l.artboard() {
+            crate::artboard_cmds::validate_translation(board.rect, dx, dy)?;
+        }
+        shift_shown(&snapshot, l, dx, dy);
     }
     Ok(out)
 }
@@ -382,6 +476,7 @@ fn shift_shown(doc: &Document, l: &mut Layer, dx: i32, dy: i32) {
         LayerContent::Group(g) => {
             if let Some(ab) = &mut g.artboard {
                 ab.rect = ab.rect.translate(dx, dy);
+                ab.guides.translate(dx, dy);
             }
             g.children.iter_mut().for_each(|c| shift_shown(doc, c, dx, dy));
         }
@@ -984,6 +1079,21 @@ pub fn move_to(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     let moved_ids = top_level(doc, &requested);
+    let parent_len = if pos == "into" { target_path.len() } else { target_path.len().saturating_sub(1) };
+    if parent_len > 0 && moved_ids.iter().any(|id| doc.layer(*id).is_some_and(|l| l.artboard().is_some())) {
+        return Err(bad(CMD, "artboards must remain top-level groups"));
+    }
+    let destination_locks = if parent_len == 0 {
+        photocraft_doc::Locks::default()
+    } else {
+        doc.locks_at(target_path.get(..parent_len).ok_or_else(|| bad(CMD, "invalid destination path"))?)
+    };
+    if destination_locks.all {
+        return Err(bad(CMD, "the destination is locked"));
+    }
+    if !copy && moved_ids.iter().any(|id| doc.effective_locks(*id).all || doc.effective_locks(*id).position) {
+        return Err(bad(CMD, "a source layer is locked"));
+    }
     if moved_ids.len() == 1 && moved_ids[0] == target && batch.is_none() && !copy {
         // Preserve single-layer drag-to-self semantics.
         return Ok(Value::Null);
@@ -1149,6 +1259,9 @@ fn reverse(s: &mut Session) -> Result<Value> {
 /// groups. Called at the end of a `Session::edit` closure, so an `Err` leaves the document and
 /// history untouched.
 pub(crate) fn check_group_depth(doc: &Document, what: &str) -> Result<()> {
+    if doc.walk().iter().any(|(path, _, layer)| path.len() != 1 && layer.artboard().is_some()) {
+        return Err(EngineError::Other(format!("{what} would nest an artboard; artboards must be top-level groups")));
+    }
     if doc.max_group_depth() > photocraft_doc::MAX_GROUP_DEPTH {
         return Err(EngineError::Other(format!("{what} would nest layers deeper than {} groups", photocraft_doc::MAX_GROUP_DEPTH)));
     }

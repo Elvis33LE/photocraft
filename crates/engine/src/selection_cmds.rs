@@ -3,7 +3,7 @@
 //! Selections are grayscale coverage surfaces clipped to the canvas.
 
 use photocraft_algo::selection::{self as sel, SelectionMode};
-use photocraft_doc::Document;
+use photocraft_doc::{Document, LayerId};
 use photocraft_geom::Rect;
 use serde_json::{Value, json};
 
@@ -48,7 +48,7 @@ fn scope_color_range(mask: &mut [f32], doc: &Document, area: Rect, m: SelectionM
 /// RGBA pixels the tools sample: the composite, or the active layer.
 fn sample_pixels(s: &Session, all_layers: bool) -> Result<(Rect, Vec<[f32; 4]>)> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
-    let area = d.doc.bounds();
+    let area = d.doc.editing_bounds(d.active_layer);
     let layer = d.active_layer.and_then(|id| d.doc.layer(id)).and_then(|l| l.surface());
     match (all_layers, layer) {
         (false, Some(surf)) => {
@@ -68,8 +68,8 @@ fn set_selection(s: &mut Session, label: &str, area: Rect, mask: Vec<f32>, m: Se
     Ok(json!({ "selected": selected }))
 }
 
-fn current_mask(doc: &Document) -> (Rect, Vec<f32>) {
-    let area = doc.bounds();
+fn current_mask(doc: &Document, active: Option<LayerId>) -> (Rect, Vec<f32>) {
+    let area = doc.editing_bounds(active);
     (area, sel::mask_from_surface(doc.selection.as_ref(), area))
 }
 
@@ -104,7 +104,7 @@ fn shown_gray(s: &Session) -> Option<(Rect, Vec<[u8; 4]>)> {
 /// 8-bit RGBA of the active layer (or the composite with `all_layers`) over the canvas.
 pub(crate) fn sample_rgba8(s: &Session, all_layers: bool) -> Result<(Rect, Vec<[u8; 4]>)> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
-    let area = d.doc.bounds();
+    let area = d.doc.editing_bounds(d.active_layer);
     let layer = d.active_layer.and_then(|id| d.doc.layer(id)).and_then(|l| l.surface());
     match (all_layers, layer) {
         (false, Some(surf)) => Ok((area, sel::rgba8_image(surf, area))),
@@ -224,8 +224,9 @@ impl ColorRangeSamples {
     /// Prepare the query without allocating a full-resolution composite. Point samples use
     /// exactly the same compositor/profile as the final selection.
     pub fn new(s: &Session, p: &Value) -> Result<Self> {
-        let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
-        let area = doc.bounds();
+        let d = s.active().ok_or(EngineError::NoDocument)?;
+        let doc = &d.doc;
+        let area = doc.editing_bounds(d.active_layer);
         let bad = |msg: String| EngineError::BadParams { cmd: "select.colorRange".into(), msg };
         let sample = |key: &str| -> Result<Vec<sel::RangeSample>> {
             let Some(pts) = p.get(key) else { return Ok(Vec::new()) };
@@ -413,8 +414,19 @@ fn color_range(s: &mut Session, p: &Value) -> Result<Value> {
             // warning shows them: judged on the composite.
             let d = s.active().ok_or(EngineError::NoDocument)?;
             let pv = s.color.proof(d.doc.id);
-            let (m, _) = crate::color_cmds::gamut_mask(&d.doc, &pv.setup, pv.gamut_threshold)?;
-            (d.doc.bounds(), m.iter().map(|v| f32::from(*v) / 255.0).collect())
+            let board = d
+                .active_layer
+                .and_then(|id| d.doc.artboard_of(id))
+                .map(|id| {
+                    let mut normalized = crate::artboard_export::frame_document(&d.doc, id, true)?;
+                    if let Some(layer) = normalized.layer_mut(id) {
+                        layer.visible = d.doc.layer(id).is_some_and(|l| l.visible);
+                    }
+                    Ok::<_, EngineError>(normalized)
+                })
+                .transpose()?;
+            let (m, _) = crate::color_cmds::gamut_mask(board.as_ref().unwrap_or(&d.doc), &pv.setup, pv.gamut_threshold)?;
+            (d.doc.editing_bounds(d.active_layer), m.iter().map(|v| f32::from(*v) / 255.0).collect())
         }
         other => {
             return Err(bad(format!(
@@ -452,7 +464,8 @@ fn modify(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
     // continue past the canvas. Border has no such option: its band always follows the canvas edge,
     // or a Select All would border to nothing.
     let at_bounds = op == "border" || b(p, "applyAtCanvasBounds", false);
-    let (area, m) = current_mask(&s.active().ok_or(EngineError::NoDocument)?.doc);
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let (area, m) = current_mask(&d.doc, d.active_layer);
     let (w, h) = (area.width() as usize, area.height() as usize);
     // Feather reaches 3σ = 3 r (σ = r, as in Photoshop); the others reach r. A margin past that
     // keeps the canvas edge out of reach. A selection clear of the canvas edge needs none: both
@@ -536,7 +549,8 @@ fn crop_mask(m: &[f32], pw: usize, pad: usize, w: usize, h: usize) -> Vec<f32> {
 fn grow_similar(s: &mut Session, p: &Value, contiguous: bool) -> Result<Value> {
     let tol = f(p, "tolerance", 32.0) / 255.0;
     let (area, px) = sample_pixels(s, b(p, "sampleAllLayers", false))?;
-    let (_, m) = current_mask(&s.active().ok_or(EngineError::NoDocument)?.doc);
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let (_, m) = current_mask(&d.doc, d.active_layer);
     let (mut lo, mut hi) = ([f32::MAX; 4], [f32::MIN; 4]);
     for (q, v) in px.iter().zip(&m) {
         if *v >= 0.5 {
@@ -594,7 +608,8 @@ pub(crate) fn polygon_selection(s: &mut Session, cmd: &str, label: &str, pts: &[
     if !(0.0..=1000.0).contains(&feather) {
         return Err(EngineError::BadParams { cmd: cmd.into(), msg: "feather must be a number in 0..1000".into() });
     }
-    let area = s.active().ok_or(EngineError::NoDocument)?.doc.bounds();
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let area = d.doc.editing_bounds(d.active_layer);
     let mut mask = sel::polygon(pts, area, b(p, "antiAlias", true));
     if feather > 0.0 {
         mask = sel::feather(&mask, area.width() as usize, area.height() as usize, feather);
@@ -828,7 +843,7 @@ mod tests {
                     let pixels = photocraft_compose::render(&doc, doc.bounds());
                     let preview = q.coverage(&pixels.px, 24, 1.0, [0.0, 0.0]);
                     s.execute("select.colorRange", p).unwrap();
-                    let actual = current_mask(&s.active().unwrap().doc).1;
+                    let actual = current_mask(&s.active().unwrap().doc, None).1;
                     for (shown, selected) in preview.iter().zip(actual) {
                         let rounded = (shown.clamp(0.0, 1.0) * 255.0 + 0.5).floor() / 255.0;
                         assert_eq!(rounded, selected, "{depth:?}: original-pixel preview and OK differ");
@@ -1145,11 +1160,11 @@ mod tests {
             ("feather", 0.0),
             ("feather", 0.05),
         ];
-        let before = current_mask(&s.active().unwrap().doc).1;
+        let before = current_mask(&s.active().unwrap().doc, None).1;
         for (op, r) in below {
             let err = s.execute(&format!("select.modify.{op}"), json!({"radius": r})).unwrap_err();
             assert!(matches!(err, EngineError::BadParams { .. }), "{op} {r}: {err}");
-            assert!(current_mask(&s.active().unwrap().doc).1 == before, "{op} {r}: the selection changed");
+            assert!(current_mask(&s.active().unwrap().doc, None).1 == before, "{op} {r}: the selection changed");
         }
         // The minimum itself is still accepted.
         s.execute("select.modify.feather", json!({"radius": 0.1})).unwrap();

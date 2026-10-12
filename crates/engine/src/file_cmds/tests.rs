@@ -731,6 +731,27 @@ fn guide_layouts() {
 }
 
 #[test]
+fn owned_guide_layouts_are_atomic_and_keep_document_guides() {
+    let mut s = session(100, 50, 8);
+    let a = s.execute("layer.new.artboard", json!({"rect": [-20, -10, 40, 30]})).unwrap()["layer"].as_u64().unwrap();
+    let b = s.execute("layer.new.artboard", json!({"rect": [60, 0, 40, 30]})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("view.newGuide", json!({"orientation": "vertical", "position": -20})).unwrap();
+    s.execute("view.newGuideLayout", json!({"artboards": [a, b], "columns": 1, "rows": 1, "clearExisting": true})).unwrap();
+    assert_eq!(doc(&s).guides.vertical, vec![-20.0]);
+    assert_eq!(doc(&s).layer(LayerId(a)).unwrap().artboard().unwrap().guides.vertical, vec![-20.0, 20.0]);
+    assert_eq!(doc(&s).layer(LayerId(b)).unwrap().artboard().unwrap().guides.vertical, vec![60.0, 100.0]);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(doc(&s).layer(LayerId(a)).unwrap().artboard().unwrap().guides.vertical.is_empty());
+    assert!(doc(&s).layer(LayerId(b)).unwrap().artboard().unwrap().guides.vertical.is_empty());
+    s.execute("view.newGuide", json!({"artboard": a, "orientation": "vertical", "position": -20})).unwrap();
+    s.execute("view.moveGuide", json!({"artboard": a, "orientation": "vertical", "index": 0, "position": 15})).unwrap();
+    assert_eq!(doc(&s).guides.vertical, vec![-20.0]);
+    assert_eq!(doc(&s).layer(LayerId(a)).unwrap().artboard().unwrap().guides.vertical, vec![15.0]);
+    assert!(s.execute("view.newGuide", json!({"artboard": "bad", "position": 5})).is_err());
+    assert!(s.execute("view.newGuideLayout", json!({"artboards": [a, u64::MAX], "columns": 1})).is_err());
+}
+
+#[test]
 fn only_layered_files_save_in_place() {
     for path in ["a.psd", "dir/a.PSB", r"C:\w\a.pcraft", "my.dir/a.psd", "a.ora", "dir/A.ORA"] {
         assert!(saves_in_place(path), "{path}");

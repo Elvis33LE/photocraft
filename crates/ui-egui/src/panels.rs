@@ -1257,6 +1257,7 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     }
                     // Every theme gets the font, style and size controls (#1387), as with Auto-Select (#1275).
                     Tool::Type | Tool::VerticalType | Tool::HorizontalTypeMask | Tool::VerticalTypeMask => crate::type_tool::options_bar(app, ui),
+                    Tool::Artboard => crate::artboard_tool::options(app, ui),
                     Tool::Move if t.pro => {
                         let o = &mut app.ui.tool_options;
                         widgets::checkbox(ui, &mut o.move_auto_select, tl!("Auto-Select:"));
@@ -2080,6 +2081,7 @@ fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 ("type", "type", tl!("Filter for type layers")),
                 ("shape", "square", tl!("Filter for shape layers")),
                 ("smart", "app-window", tl!("Filter for smart objects")),
+                ("artboard", "panels-top-left", tl!("Filter for artboards")),
             ] {
                 let on = app.ui.layer_filter.iter().any(|k| k == kind);
                 if icons::button(ui, icon, 22.0, on, tip).clicked() {
@@ -2226,9 +2228,10 @@ fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         LayerContent::Text(_) => "type",
                         LayerContent::Shape(_) => "shape",
                         LayerContent::Smart(_) => "smart",
+                        LayerContent::Group(g) if g.artboard.is_some() => "artboard",
                         LayerContent::Group(_) => "",
                     };
-                    if !filter.iter().any(|k| k == kind) {
+                    if !filter.iter().any(|k| k == kind) && !(filter.iter().any(|k| k == "artboard") && doc.artboard_of(l.id).is_some()) {
                         continue;
                     }
                 }
@@ -2573,8 +2576,15 @@ fn layer_row(
 ) -> Rect {
     let selected = row.selected;
     let t = Tokens::get(ctx);
+    let artboard = l.artboard().is_some();
     // Photoshop's default (medium) thumbnails: 32 pt rows.
-    let row_h = if t.pro { 32.0 } else { 46.0 };
+    let row_h = if artboard {
+        26.0
+    } else if t.pro {
+        32.0
+    } else {
+        46.0
+    };
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
     // A drag from a mask's thumbnail drags that mask, not the layer (#3113, #3119).
     let mask_drag = starts_mask_drag(ctx, l, &resp);
@@ -2643,17 +2653,31 @@ fn layer_row(
         + if l.is_group() { crate::layer_tree_ui::TRIANGLE_W } else { 0.0 }
         + if l.clipped { 12.0 } else { 0.0 }
         + crate::layer_row_ui::reserved_width(l);
-    let ts = crate::mask_thumbs_ui::thumb_size(l, if t.pro { 24.0 } else { 34.0 }, rect.width() - others);
-    let fixed = others + ts + 6.0 + crate::mask_thumbs_ui::width(l, ts);
+    let ts = crate::mask_thumbs_ui::thumb_size(
+        l,
+        if artboard {
+            18.0
+        } else if t.pro {
+            24.0
+        } else {
+            34.0
+        },
+        rect.width() - others,
+    );
+    let fixed = others + if artboard { 0.0 } else { ts + 6.0 } + crate::mask_thumbs_ui::width(l, ts);
     x += 28.0 + crate::layer_row_ui::indent(depth, rect.width(), fixed);
     let toggled = crate::layer_tree_ui::disclosure(ui, rect, &mut x, l, actions);
     if l.clipped {
         paint_clipping_indicator(&painter, pos2(x, rect.center().y), t.text_faint);
         x += 12.0;
     }
-    let thumb = Rect::from_min_size(pos2(x, rect.center().y - ts / 2.0), vec2(ts, ts));
-    draw_layer_thumb(app, ctx, ui, doc, l, thumb, row.primary);
-    x += ts + 6.0;
+    // Artboards are compact group headers: their frame is represented on the canvas, while
+    // the layer tree shows the disclosure and name without a content or folder thumbnail.
+    let thumb = (!artboard).then(|| Rect::from_min_size(pos2(x, rect.center().y - ts / 2.0), vec2(ts, ts)));
+    if let Some(thumb) = thumb {
+        draw_layer_thumb(app, ctx, ui, doc, l, thumb, row.primary);
+        x += ts + 6.0;
+    }
     // Link chains and pixel / vector mask thumbnails (#153).
     let masks = crate::mask_thumbs_ui::paint(app, ctx, ui, &painter, doc, l, &mut x, rect.center().y, ts, actions);
     let mask_rect = masks.thumb(crate::mask_thumbs_ui::MaskKind::Pixel);
@@ -2664,9 +2688,9 @@ fn layer_row(
         let target = if app.ui.vector_mask_target && vector_rect.is_some() {
             vector_rect
         } else if app.ui.mask_target {
-            mask_rect.or(Some(thumb))
+            mask_rect.or(thumb)
         } else {
-            Some(thumb)
+            thumb
         };
         if let Some(r) = target {
             crate::mask_thumbs_ui::paint_brackets(&painter, r, t.text);
@@ -2683,11 +2707,17 @@ fn layer_row(
         start_fx_drag(ctx, l.id, None);
     }
     let name_color = if l.visible { t.text } else { t.text_faint };
-    let font = if selected && !t.pro { theme::medium(13.0) } else { egui::FontId::proportional(if t.pro { 12.0 } else { 13.0 }) };
+    let font = if artboard {
+        theme::semibold(if t.pro { 12.0 } else { 13.0 })
+    } else if selected && !t.pro {
+        theme::medium(13.0)
+    } else {
+        egui::FontId::proportional(if t.pro { 12.0 } else { 13.0 })
+    };
     // Photoshop before 2026 set the Background layer's name in italics; 2026 sets it upright.
     let italic = !t.pro && l.name == "Background" && l.locks.transparency;
     // Photoshop rows show only the name; the kind sub-label is a Studio-theme addition.
-    let is_pixel = t.pro || matches!(l.content, LayerContent::Raster(_));
+    let is_pixel = t.pro || artboard || matches!(l.content, LayerContent::Raster(_));
     let name_rect = crate::layer_row_ui::truncated(&painter, &l.name, font, name_color, italic, name_right - x).map(|galley| {
         let text_pos = pos2(x, rect.center().y - galley.size().y / 2.0 - if is_pixel { 0.0 } else { 7.0 });
         let r = Rect::from_min_size(text_pos, galley.size());
@@ -2710,7 +2740,9 @@ fn layer_row(
         if let Some(kind) = masks.hit(p) {
             return Some(crate::mask_thumbs_ui::load_params(l, kind, m));
         }
-        thumb.expand(2.0).contains(p).then(|| json!({"channel": "transparency", "layer": l.id.0, "operation": crate::channels_panel::load_operation(m)}))
+        thumb
+            .is_some_and(|r| r.expand(2.0).contains(p))
+            .then(|| json!({"channel": "transparency", "layer": l.id.0, "operation": crate::channels_panel::load_operation(m)}))
     });
     // ⇧-click a mask thumbnail: disable / enable that mask; ⌥-click a layer mask: view it.
     let mask_toggle = resp.clicked().then(|| (ui.input(|i| i.modifiers), resp.interact_pointer_pos())).and_then(|(m, pos)| {
@@ -2728,11 +2760,13 @@ fn layer_row(
         // defaults to its mask, but clicking its content thumbnail must leave the mask target.
         let pos = resp.interact_pointer_pos();
         let on_mask = mask_rect.zip(pos).is_some_and(|(r, p)| r.expand(2.0).contains(p));
-        let on_thumb = pos.is_some_and(|p| thumb.expand(2.0).contains(p));
+        let on_thumb = thumb.zip(pos).is_some_and(|(r, p)| r.expand(2.0).contains(p));
         let on_vector = pos.and_then(|p| masks.hit(p)) == Some(crate::mask_thumbs_ui::MaskKind::Vector);
+        // A compact artboard header replaces the content thumbnail as the content target.
+        let on_content = on_thumb || (artboard && !on_mask && !on_vector);
         // Clicking the layer thumbnail leaves mask view (#196).
         let viewing = app.session.active().and_then(photocraft_engine::mask_view_cmds::current).is_some_and(|v| v.layer == l.id);
-        if on_thumb && viewing {
+        if on_content && viewing {
             actions.push((photocraft_engine::mask_view_cmds::ID.into(), json!({"layer": l.id.0, "mode": "off"})));
         }
         let content_less = matches!(l.content, LayerContent::Adjustment(_) | LayerContent::Fill(_));
@@ -2747,7 +2781,7 @@ fn layer_row(
                 app.ui.properties_layer = None;
             }
             actions.push(("ui.maskTarget".into(), json!(true)));
-        } else if on_thumb || !row.primary {
+        } else if on_content || !row.primary {
             actions.push(("ui.maskTarget".into(), json!(false)));
         }
     }
@@ -2781,9 +2815,9 @@ fn layer_row(
             }
         } else if pos.and_then(|p| masks.hit(p)).is_none() {
             let id = match &l.content {
-                LayerContent::Adjustment(_) | LayerContent::Fill(_) | LayerContent::Shape(_) if on(thumb) => "layer.layerContentOptions",
-                LayerContent::Smart(_) if on(thumb) => "layer.smartObjects.editContents",
-                LayerContent::Text(_) if on(thumb) => "type.editText",
+                LayerContent::Adjustment(_) | LayerContent::Fill(_) | LayerContent::Shape(_) if thumb.is_some_and(on) => "layer.layerContentOptions",
+                LayerContent::Smart(_) if thumb.is_some_and(on) => "layer.smartObjects.editContents",
+                LayerContent::Text(_) if thumb.is_some_and(on) => "type.editText",
                 _ => "layer.layerStyle.blendingOptions",
             };
             if crate::menus::is_enabled(app, id) {
@@ -4811,13 +4845,16 @@ mod toolbar_hidden_tests {
 
     #[test]
     fn a_slot_keeps_only_its_visible_tools_and_its_index() {
-        let sections = visible_sections(&["Sponge".to_string(), "Move".to_string(), "Artboard".to_string()]);
-        assert_eq!(sections.len(), TOOL_SECTIONS.len() - 1, "the Move section has no tools left");
+        let sections = visible_sections(&["Sponge".to_string(), "Move".to_string()]);
+        assert_eq!(sections.len(), TOOL_SECTIONS.len(), "the Move section keeps the Artboard tool");
+        assert_eq!(sections[0][0].1, vec![Tool::Artboard]);
         let index = TOOL_SECTIONS.iter().flat_map(|section| section.iter()).position(|slot| slot.contains(&Tool::Sponge)).unwrap();
         let slot = sections.iter().flatten().find(|(i, _)| *i == index).map(|(_, tools)| tools.clone());
         assert_eq!(slot, Some(vec![Tool::Dodge, Tool::Burn]));
         assert!(sections.iter().flatten().all(|(_, tools)| !tools.contains(&Tool::Move) && !tools.contains(&Tool::Sponge)));
         assert_eq!(visible_sections(&[]).iter().map(Vec::len).sum::<usize>(), TOOL_SECTIONS.iter().map(|section| section.len()).sum::<usize>());
+        let without_move_section = visible_sections(&["Sponge".to_string(), "Move".to_string(), "Artboard".to_string()]);
+        assert_eq!(without_move_section.len(), TOOL_SECTIONS.len() - 1, "hiding Artboard and Move removes their empty section");
         let by_command = visible_sections(&["sponge".to_string(), "move".to_string(), "artboard".to_string()]);
         assert_eq!(by_command, sections, "edit.toolbar names are read like `ui.set {{tool}}` names");
     }
@@ -5127,6 +5164,133 @@ mod layer_drag_edge_scroll_tests {
         assert!(layer_drag_edge_scroll(Some(pos2(10.0, 2.0)), viewport, true, 0.016) > 0.0);
         assert!(layer_drag_edge_scroll(Some(pos2(10.0, 38.0)), viewport, true, 0.016) < 0.0);
         assert_eq!(layer_drag_edge_scroll(Some(pos2(10.0, 20.0)), viewport, true, 0.016), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod artboard_header_tests {
+    use super::*;
+    use egui_kittest::{Harness, kittest::Queryable};
+    use photocraft_doc::{Artboard, ArtboardBackground, ColorMode, Document, SampleType, Size};
+
+    fn row(h: &Harness<'_, PhotocraftApp>, id: LayerId) -> crate::layer_row_ui::RowRects {
+        crate::layer_row_ui::recorded(&h.ctx).into_iter().find(|r| r.layer == id.0).unwrap()
+    }
+
+    fn harness(mut app: PhotocraftApp, theme: theme::ThemeKind) -> Harness<'static, PhotocraftApp> {
+        app.ui.theme = theme;
+        let mut initialized = false;
+        let mut h = Harness::builder().with_size(vec2(320.0, 500.0)).build_ui_state(
+            move |ui, app| {
+                // build_ui_state renders immediately; font definitions take effect next pass.
+                if !initialized {
+                    PhotocraftApp::setup_context(ui.ctx(), theme);
+                    initialized = true;
+                    return;
+                }
+                layers(app, ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        h
+    }
+
+    fn click(h: &mut Harness<'_, PhotocraftApp>, point: Pos2) {
+        click_with(h, point, egui::Modifiers::NONE);
+    }
+
+    fn click_with(h: &mut Harness<'_, PhotocraftApp>, point: Pos2, modifiers: egui::Modifiers) {
+        h.hover_at(point);
+        h.event(egui::Event::ModifiersChanged(modifiers));
+        h.run_steps(1);
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed, modifiers });
+            h.run_steps(1);
+        }
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        h.run_steps(2);
+    }
+
+    #[test]
+    fn artboard_header_returns_from_pixel_vector_and_mask_view_to_content() {
+        for theme in [theme::ThemeKind::ProMedium, theme::ThemeKind::Studio] {
+            let mut session = photocraft_engine::Session::new();
+            session.add_document(Document::new("masked header", Size::new(40, 30), ColorMode::Rgb, SampleType::U8), None);
+            let board = LayerId(session.execute("layer.new.artboard", json!({"name":"Board","rect":[0,0,40,30]})).unwrap()["layer"].as_u64().unwrap());
+            session.execute("layer.layerMask.revealAll", json!({"layer":board.0})).unwrap();
+            session.execute("layer.vectorMask.add", json!({"layer":board.0,"path":{"subpaths":[{"knots":[[0,0],[40,0],[40,30],[0,30]]}]}})).unwrap();
+            let mut h = harness(PhotocraftApp::new(session, crate::Services::default()), theme);
+            let mask = |h: &Harness<'_, PhotocraftApp>, kind| {
+                crate::mask_thumbs_ui::recorded(&h.ctx, board.0).unwrap().0.into_iter().find(|(k, _)| *k == kind).unwrap().1.center()
+            };
+            let pixel = mask(&h, crate::mask_thumbs_ui::MaskKind::Pixel);
+            click(&mut h, pixel);
+            assert!(h.state().ui.mask_target);
+            let name = row(&h, board).name.unwrap().center();
+            click(&mut h, name);
+            assert!(!h.state().ui.mask_target && !h.state().ui.vector_mask_target);
+            click_with(&mut h, pixel, egui::Modifiers::ALT);
+            assert!(h.state().session.active().and_then(photocraft_engine::mask_view_cmds::current).is_some());
+            click(&mut h, name);
+            assert!(h.state().session.active().and_then(photocraft_engine::mask_view_cmds::current).is_none());
+            assert!(!h.state().ui.mask_target && !h.state().ui.vector_mask_target);
+            let vector = mask(&h, crate::mask_thumbs_ui::MaskKind::Vector);
+            click(&mut h, vector);
+            assert!(h.state().ui.vector_mask_target);
+            click(&mut h, name);
+            assert!(!h.state().ui.mask_target && !h.state().ui.vector_mask_target);
+            assert_eq!(h.state().session.active().unwrap().active_layer, Some(board));
+        }
+    }
+
+    #[test]
+    fn compact_artboard_header_preserves_selection_disclosure_visibility_and_drop() {
+        for theme in [theme::ThemeKind::ProMedium, theme::ThemeKind::Studio] {
+            let mut doc = Document::new("headers", Size::new(40, 30), ColorMode::Rgb, SampleType::U8);
+            let child = Layer::raster("Inside", doc.pixel_format());
+            let child_id = child.id;
+            let mut board = Layer::group("Board", vec![child]);
+            if let LayerContent::Group(g) = &mut board.content {
+                g.artboard =
+                    Some(Artboard { rect: doc.bounds(), background: ArtboardBackground::Transparent, preset: String::new(), guides: Default::default() });
+            }
+            let board_id = board.id;
+            let ordinary = Layer::group("Ordinary", vec![]);
+            let ordinary_id = ordinary.id;
+            let outside = Layer::raster("Outside", doc.pixel_format());
+            let outside_id = outside.id;
+            doc.layers = vec![board, ordinary, outside];
+            let mut session = photocraft_engine::Session::new();
+            session.add_document(doc, None);
+            let mut h = harness(PhotocraftApp::new(session, crate::Services::default()), theme);
+            let header = row(&h, board_id);
+            assert!(header.row.height() < row(&h, ordinary_id).row.height());
+            assert!(row(&h, child_id).name.unwrap().left() > header.name.unwrap().left(), "contents remain indented below their header");
+            click(&mut h, header.name.unwrap().center());
+            assert_eq!(h.state().session.active().unwrap().active_layer, Some(board_id));
+            assert!(h.state().session.active().unwrap().doc.selection.is_none(), "the header has no thumbnail selection hit area");
+            let collapse = h.get_by_label("Collapse group Board").rect().center();
+            click(&mut h, collapse);
+            assert!(!crate::layer_row_ui::recorded(&h.ctx).iter().any(|r| r.layer == child_id.0));
+            assert_eq!(h.state().session.active().unwrap().active_layer, Some(board_id));
+            let header = row(&h, board_id);
+            click(&mut h, pos2(header.row.left() + 15.0, header.row.center().y));
+            assert!(!h.state().session.active().unwrap().doc.layer(board_id).unwrap().visible);
+            let start = row(&h, outside_id).name.unwrap().center();
+            click(&mut h, start);
+            h.drag_at(start);
+            h.run_steps(2);
+            let target = row(&h, board_id).name.unwrap().center();
+            h.hover_at(target);
+            h.run_steps(2);
+            h.drop_at(target);
+            h.run_steps(4);
+            assert!(
+                h.state().session.active().unwrap().doc.layer(board_id).unwrap().children().unwrap().iter().any(|l| l.id == outside_id),
+                "the compact header remains an into-group drop target"
+            );
+        }
     }
 }
 

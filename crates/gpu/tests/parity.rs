@@ -1946,13 +1946,18 @@ fn artboards() {
             let mut ab = Layer::group("Artboard", vec![child, fx]);
             ab.blend = blend;
             if let LayerContent::Group(gr) = &mut ab.content {
-                gr.artboard = Some(Artboard { rect: Rect::new(12, 6, 60, 40), background: bg, preset: String::new() });
+                gr.artboard = Some(Artboard { rect: Rect::new(12, 6, 60, 40), background: bg, preset: String::new(), guides: Default::default() });
             }
             d.layers.push(ab);
             // A second, partly off-canvas board.
             let mut ab2 = Layer::group("Artboard 2", vec![noise_layer("c2", PixelFormat::RGBA8, Rect::new(0, 0, 72, 48), 52, 0.3)]);
             if let LayerContent::Group(gr) = &mut ab2.content {
-                gr.artboard = Some(Artboard { rect: Rect::new(50, 30, 90, 70), background: ArtboardBackground::Black, preset: String::new() });
+                gr.artboard = Some(Artboard {
+                    rect: Rect::new(50, 30, 90, 70),
+                    background: ArtboardBackground::Black,
+                    preset: String::new(),
+                    guides: Default::default(),
+                });
             }
             d.layers.push(ab2);
             fx_check(&mut g, &d, &format!("artboard {bg:?} {blend:?}"));

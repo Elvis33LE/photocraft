@@ -90,6 +90,7 @@ pub(crate) fn unit_menu(ui: &mut egui::Ui, current: Unit) -> Option<&'static str
 /// A guide being dragged: from a ruler (new) or an existing one (index).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GuideDrag {
+    pub artboard: Option<photocraft_doc::LayerId>,
     pub vertical: bool,
     pub index: Option<usize>,
     pub pos: f64,
@@ -177,10 +178,30 @@ pub fn draw_guides(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform,
     if app.ui.extras.guides || preview.is_some() {
         for (vertical, list) in [(true, &guides.vertical), (false, &guides.horizontal)] {
             for (i, p) in list.iter().enumerate() {
-                if drag.is_some_and(|d| d.vertical == vertical && d.index == Some(i)) {
+                if drag.is_some_and(|d| d.artboard.is_none() && d.vertical == vertical && d.index == Some(i)) {
                     continue;
                 }
                 line(vertical, *p, own(vertical, *p));
+            }
+        }
+        for (id, _, board) in doc.artboards() {
+            if doc.layer(id).is_none_or(|l| !l.visible) {
+                continue;
+            }
+            let p = painter.with_clip_rect(clip.intersect(xf.doc_rect(board.rect)));
+            for (vertical, list) in [(true, &board.guides.vertical), (false, &board.guides.horizontal)] {
+                for (i, pos) in list.iter().enumerate() {
+                    if drag.is_some_and(|d| d.artboard == Some(id) && d.vertical == vertical && d.index == Some(i)) {
+                        continue;
+                    }
+                    let r = board.rect;
+                    let (a, b) = if vertical {
+                        (xf.to_screen(*pos, r.y0 as f32), xf.to_screen(*pos, r.y1 as f32))
+                    } else {
+                        (xf.to_screen(r.x0 as f32, *pos), xf.to_screen(r.x1 as f32, *pos))
+                    };
+                    styled_line(&p, a, b, Stroke::new(1.0, guide), style);
+                }
             }
         }
     }
@@ -193,6 +214,49 @@ pub fn draw_guides(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform,
 
 /// Existing guide under a document point (within 4 screen px).
 pub fn guide_at(app: &PhotocraftApp, x: f64, y: f64) -> Option<(bool, usize)> {
+    guide_hit(app, x, y).map(|(_, vertical, index)| (vertical, index))
+}
+
+pub fn guide_owner_at(app: &PhotocraftApp, x: f64, y: f64) -> Option<photocraft_doc::LayerId> {
+    guide_hit(app, x, y).and_then(|(owner, _, _)| owner)
+}
+
+pub fn selected_artboard(app: &PhotocraftApp) -> Option<photocraft_doc::LayerId> {
+    let st = app.session.active()?;
+    st.doc.artboard_of(st.active_layer?)
+}
+
+/// Guide dialogs expose scope by board name; numeric owner IDs never become form controls.
+pub fn guide_form(app: &PhotocraftApp, ui: &mut egui::Ui, fields: &mut serde_json::Map<String, serde_json::Value>) {
+    let boards: Vec<(u64, String)> = app.session.active().map(|st| st.doc.artboards().iter().map(|b| (b.0.0, b.1.to_string())).collect()).unwrap_or_default();
+    let mut scope = fields
+        .get("artboard")
+        .and_then(serde_json::Value::as_u64)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| if fields.contains_key("artboards") { "all".into() } else { "document".into() });
+    let mut choices = vec![("document".to_string(), tl!("Document").to_string())];
+    choices.extend(boards.iter().map(|(id, name)| (id.to_string(), name.clone())));
+    if fields.get("__command").and_then(serde_json::Value::as_str) == Some("view.newGuideLayout") && !boards.is_empty() {
+        choices.push(("all".into(), tl!("All Artboards").to_string()));
+    }
+    let refs: Vec<(String, &str)> = choices.iter().map(|(key, label)| (key.clone(), label.as_str())).collect();
+    ui.horizontal(|ui| {
+        ui.label(tl!("Target"));
+        crate::widgets::dropdown(ui, "guide-target", &mut scope, &refs, 200.0);
+    });
+    let mut form = fields.clone();
+    form.remove("artboard");
+    form.remove("artboards");
+    crate::view_cmds::form_body(ui, &mut form);
+    if scope == "all" {
+        form.insert("artboards".into(), json!(boards.iter().map(|b| b.0).collect::<Vec<_>>()));
+    } else if let Ok(id) = scope.parse::<u64>() {
+        form.insert("artboard".into(), json!(id));
+    }
+    *fields = form;
+}
+
+fn guide_hit(app: &PhotocraftApp, x: f64, y: f64) -> Option<(Option<photocraft_doc::LayerId>, bool, usize)> {
     // Hidden canvas guides are not interactive: the Move tool must reach the layer below.
     // Keep hit testing consistent with the visibility gate in canvas::draw.
     if !app.ui.extras.guides || !app.ui.view.shows(app.ui.view.show.canvas_guides) || app.ui.extras.lock_guides {
@@ -200,14 +264,27 @@ pub fn guide_at(app: &PhotocraftApp, x: f64, y: f64) -> Option<(bool, usize)> {
     }
     let doc = &app.session.active()?.doc;
     let tol = 4.0 / app.point_zoom().max(0.01) as f64;
+    for (id, _, a) in doc.artboards().into_iter().rev() {
+        if doc.layer(id).is_none_or(|l| !l.visible) {
+            continue;
+        }
+        if x < a.rect.x0 as f64 || x > a.rect.x1 as f64 || y < a.rect.y0 as f64 || y > a.rect.y1 as f64 {
+            continue;
+        }
+        for (vertical, list, coordinate) in [(true, &a.guides.vertical, x), (false, &a.guides.horizontal, y)] {
+            if let Some(i) = list.iter().position(|g| (*g as f64 - coordinate).abs() <= tol) {
+                return Some((Some(id), vertical, i));
+            }
+        }
+    }
     for (i, g) in doc.guides.vertical.iter().enumerate() {
-        if (*g - x).abs() <= tol {
-            return Some((true, i));
+        if (*g as f64 - x).abs() <= tol {
+            return Some((None, true, i));
         }
     }
     for (i, g) in doc.guides.horizontal.iter().enumerate() {
-        if (*g - y).abs() <= tol {
-            return Some((false, i));
+        if (*g as f64 - y).abs() <= tol {
+            return Some((None, false, i));
         }
     }
     None
@@ -215,17 +292,36 @@ pub fn guide_at(app: &PhotocraftApp, x: f64, y: f64) -> Option<(bool, usize)> {
 
 /// Finish a guide drag: create, move, or delete (dropped outside the canvas).
 pub fn finish_drag(app: &mut PhotocraftApp, d: GuideDrag) {
-    let Some(size) = app.session.active().map(|s| s.doc.size) else { return };
-    let extent = if d.vertical { size.width } else { size.height } as f64;
-    let orientation = if d.vertical { "vertical" } else { "horizontal" };
-    let inside = d.pos >= 0.0 && d.pos <= extent;
-    let pos = (d.pos * 1000.0).round() / 1000.0;
-    let _ = match (d.index, inside) {
-        (None, true) => app.run("view.newGuide", json!({"orientation": orientation, "position": pos})),
-        (Some(i), true) => app.run("view.moveGuide", json!({"orientation": orientation, "index": i, "position": pos})),
-        (Some(i), false) => app.run("view.deleteGuide", json!({"orientation": orientation, "index": i})),
-        (None, false) => Ok(serde_json::Value::Null),
+    let Some(bounds) = app.session.active().map(|s| {
+        d.artboard
+            .and_then(|id| s.doc.layer(id)?.artboard().map(|a| a.rect))
+            .unwrap_or_else(|| s.doc.artboards().iter().fold(s.doc.bounds(), |r, b| r.union(&b.2.rect)))
+    }) else {
+        return;
     };
+    let orientation = if d.vertical { "vertical" } else { "horizontal" };
+    let (start, end) = if d.vertical { (bounds.x0, bounds.x1) } else { (bounds.y0, bounds.y1) };
+    let inside = d.pos >= start as f64 && d.pos <= end as f64;
+    let pos = (d.pos * 1000.0).round() / 1000.0;
+    let mut params = json!({"orientation": orientation,"position": pos});
+    if let Some(owner) = d.artboard {
+        params["artboard"] = json!(owner.0);
+    }
+    if let Some(i) = d.index {
+        params["index"] = json!(i);
+    }
+    let cmd = match (d.index, inside) {
+        (None, true) => Some("view.newGuide"),
+        (Some(_), true) => Some("view.moveGuide"),
+        (Some(_), false) => Some("view.deleteGuide"),
+        (None, false) => None,
+    };
+    if let Some(cmd) = cmd
+        && let Err(e) = app.run(cmd, params)
+    {
+        app.ui.status = e;
+        app.ui.status_error = true;
+    }
     if d.index.is_none() && inside {
         app.ui.extras.guides = true;
     }
@@ -353,7 +449,7 @@ pub fn draw_rulers(app: &mut PhotocraftApp, ui: &mut egui::Ui, full: Rect, xf: &
         if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.drag_started()) {
             let d = xf.to_doc(pos);
             let pos = crate::snap_ui::snap_guide(app, vertical, if vertical { d[0] } else { d[1] });
-            app.guide_drag = Some(GuideDrag { vertical, index: None, pos });
+            app.guide_drag = Some(GuideDrag { artboard: selected_artboard(app), vertical, index: None, pos });
         }
         if resp.drag_stopped()
             && let Some(d) = app.guide_drag.take()
@@ -539,14 +635,14 @@ mod tests {
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
         app.session.execute("file.new", json!({"width": 200, "height": 100})).unwrap();
         app.sync_views();
-        finish_drag(&mut app, GuideDrag { vertical: true, index: None, pos: 50.0 });
-        finish_drag(&mut app, GuideDrag { vertical: false, index: None, pos: 500.0 }); // off canvas: ignored
+        finish_drag(&mut app, GuideDrag { artboard: None, vertical: true, index: None, pos: 50.0 });
+        finish_drag(&mut app, GuideDrag { artboard: None, vertical: false, index: None, pos: 500.0 }); // off canvas: ignored
         assert_eq!(app.session.active().unwrap().doc.guides.vertical, vec![50.0]);
         assert!(app.session.active().unwrap().doc.guides.horizontal.is_empty());
         assert_eq!(guide_at(&app, 51.0, 10.0), Some((true, 0)));
-        finish_drag(&mut app, GuideDrag { vertical: true, index: Some(0), pos: 120.0 });
+        finish_drag(&mut app, GuideDrag { artboard: None, vertical: true, index: Some(0), pos: 120.0 });
         assert_eq!(app.session.active().unwrap().doc.guides.vertical, vec![120.0]);
-        finish_drag(&mut app, GuideDrag { vertical: true, index: Some(0), pos: -30.0 });
+        finish_drag(&mut app, GuideDrag { artboard: None, vertical: true, index: Some(0), pos: -30.0 });
         assert!(app.session.active().unwrap().doc.guides.vertical.is_empty());
         app.ui.extras.lock_guides = true;
         assert_eq!(guide_at(&app, 0.0, 0.0), None);

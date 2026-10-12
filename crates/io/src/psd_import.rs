@@ -852,6 +852,8 @@ pub fn psd_to_document_with(file: &PsdFile, ctl: &photocraft_raster::Interrupt) 
         }
     }
 
+    // Artboard ownership refers to resource 1032's original order, after runtime ids are known.
+    cx.warnings.extend(crate::comps_map::import_artboard_guides(&mut doc, file.resource(1032).map(|r| r.data.as_slice())));
     // Layer comps (resource 1065 + per-layer `cmls`); the raw data stays for verbatim export.
     let raw_comps = doc.metadata.psd_resources.iter().find(|(id, _, _)| *id == crate::comps_map::LAYER_COMPS).map(|(_, _, d)| d.clone());
     let comp_warnings;

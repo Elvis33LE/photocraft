@@ -174,7 +174,7 @@ pub fn abandon(app: &mut PhotocraftApp) {
 pub fn arrow_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
     use egui::{Key, Modifiers};
     let cmd = ctx.input(|i| i.modifiers.command) && crate::hold_keys::cmd_nudges(app);
-    if app.ui.tool != Tool::Move && app.ui.transform.is_none() && !cmd {
+    if !matches!(app.ui.tool, Tool::Move | Tool::Artboard) && app.ui.transform.is_none() && !cmd {
         return selection_arrow_keys(app, ctx);
     }
     // `consume_key` never ignores an extra ⌘, so it is part of every pattern while it moves.

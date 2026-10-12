@@ -247,14 +247,19 @@ pub(crate) fn is_preview_key(key: u64) -> bool {
 
 /// Release: one `layer.translate` by the drag's offset. The canvas already shows the result, so
 /// its caches are told it showed the document: the command's damage rect refreshes that area.
-pub(crate) fn finish(app: &mut PhotocraftApp, dx: f64, dy: f64) {
+pub(crate) fn finish(app: &mut PhotocraftApp, dx: f64, dy: f64, drop: [f64; 2]) {
     // Only when the canvas shows this very offset (else it recomposites everything once).
     let at = (dx.clamp(-1e7, 1e7) as i32, dy.clamp(-1e7, 1e7) as i32);
     let shown = app.move_preview.take().filter(|p| p.shown.is_some() && p.offsets.last() == Some(&at));
     if dx == 0.0 && dy == 0.0 {
         return;
     }
-    if app.run("layer.translate", json!({"dx": dx, "dy": dy})).is_err() {
+    let auto_nest = app.session.active().is_some_and(|st| st.doc.has_artboards());
+    if app.run("layer.translate", json!({"dx": dx, "dy": dy,"autoNest":auto_nest,"drop":drop})).is_err() {
+        return;
+    }
+    // A reparent changes clipping even when the preview's offset was identical.
+    if auto_nest {
         return;
     }
     let Some(p) = shown else { return };

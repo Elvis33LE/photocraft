@@ -537,6 +537,10 @@ fn ungroup(s: &mut Session, p: &Value) -> Result<Value> {
         let LayerContent::Group(group) = &g.content else {
             return Err(EngineError::Other("the active layer is not a group".into()));
         };
+        if doc.effective_locks(id).all {
+            return Err(EngineError::Other("the group is locked".into()));
+        }
+        let board = group.artboard.clone();
         let children = group.children.clone();
         let (&idx, parent) = path.split_last().ok_or(EngineError::NoLayer(id))?;
         let sib = if parent.is_empty() { &mut doc.layers } else { doc.layer_at_mut(parent).and_then(Layer::children_mut).ok_or(EngineError::NoLayer(id))? };
@@ -544,6 +548,15 @@ fn ungroup(s: &mut Session, p: &Value) -> Result<Value> {
         let top = children.last().map(|l| l.id);
         for (k, l) in children.into_iter().enumerate() {
             sib.insert(idx + k, l);
+        }
+        if let Some(board) = board {
+            doc.guides.extend(&board.guides);
+            if !doc.has_artboards() {
+                crate::artboard_cmds::restore_canvas(doc, board.rect)?;
+                if doc.layers.is_empty() {
+                    doc.layers.push(Layer::raster("Layer 1", doc.pixel_format()));
+                }
+            }
         }
         *active = top.or_else(|| doc.top_layer());
         Ok(())

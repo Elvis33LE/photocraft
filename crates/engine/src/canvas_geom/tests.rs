@@ -1,4 +1,20 @@
 use super::*;
+
+#[test]
+fn artboard_owned_guides_turn_with_the_frame() {
+    let mut layer = Layer::group("board", Vec::new());
+    if let LayerContent::Group(g) = &mut layer.content {
+        let mut board = photocraft_doc::Artboard::new(Rect::new(0, 0, 30, 40));
+        board.guides.horizontal.push(10.0);
+        board.guides.vertical.push(20.0);
+        g.artboard = Some(board);
+    }
+    transform_layer_geometry(&mut layer, &Affine { m: [0.0, 1.0, -1.0, 0.0, 40.0, 0.0] }, true, 72.0);
+    let board = layer.artboard().unwrap();
+    assert_eq!(board.rect, Rect::new(0, 0, 40, 30));
+    assert_eq!(board.guides.vertical, vec![30.0]);
+    assert_eq!(board.guides.horizontal, vec![20.0]);
+}
 use crate::Session;
 use photocraft_doc::vector::LiveShape;
 use serde_json::json;

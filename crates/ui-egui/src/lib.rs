@@ -491,6 +491,7 @@ pub struct PhotocraftApp {
     pub(crate) move_preview: Option<move_ui::MovePreview>,
     /// Move tool › Show Highlight on Rollover: the last hover answer (`move_hover`).
     pub(crate) move_hover: Option<move_hover::Hover>,
+    pub(crate) artboard_preview: Option<artboard_tool::Preview>,
     /// A blend mode hovered in the Layers panel, shown live (`blend_preview`).
     pub(crate) blend_preview: Option<blend_preview::BlendPreview>,
     /// Patch Tool drag: the healed document at the pointer (`patch_preview`).
@@ -714,6 +715,7 @@ impl PhotocraftApp {
             menu_cache: None,
             move_preview: None,
             move_hover: None,
+            artboard_preview: None,
             blend_preview: None,
             patch_preview: None,
             magnetic: Default::default(),
@@ -942,6 +944,7 @@ impl PhotocraftApp {
                     .session
                     .active()
                     .is_some_and(|st| st.active_layer.is_some_and(|layer| params.get("layer").and_then(Value::as_u64).is_none_or(|target| target == layer.0)));
+        let artboard_creation = artboard_tool::creation_snapshot(self, id, &params);
         let r = if id == "actions.play" {
             actions::play(self, &params)
         } else if photocraft_engine::actions_cmds::shell_view_command(id) {
@@ -988,6 +991,9 @@ impl PhotocraftApp {
                     self.ui.status = crate::i18n::trn(crate::i18n::current(), removed as u64, "{n} sample point removed", "{n} sample points removed");
                     self.ui.status_error = false;
                 }
+                if let Some(before) = &artboard_creation {
+                    artboard_tool::focus_created_board(self, before);
+                }
                 if self.ui.status_error {
                     self.ui.status.clear();
                     self.ui.status_error = false;
@@ -1013,6 +1019,7 @@ impl PhotocraftApp {
     }
 
     pub fn sync_views(&mut self) {
+        artboard_tool::cancel_stale_focus(self);
         type_transform::cancel_stale(self);
         crate::cam_transform::cancel_stale(self);
         crate::lasso_ui::cancel_stale(self);

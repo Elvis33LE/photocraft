@@ -822,6 +822,9 @@ fn content_options(s: &mut Session, _: &Value) -> Result<Value> {
 /// The layer rendered alone (visible, its blend mode ignored) and trimmed to its pixels, as a
 /// one-layer document — what Export As does for a layer.
 pub fn layer_document(doc: &Document, id: LayerId) -> Result<Document> {
+    if let Some(board) = crate::artboard_cmds::artboard_document(doc, id)? {
+        return Ok(board);
+    }
     let l = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
     let mut alone = l.clone();
     alone.visible = true;
