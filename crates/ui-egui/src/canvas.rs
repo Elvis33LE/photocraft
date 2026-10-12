@@ -4450,7 +4450,8 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
     if let ToolEvent::Down { x, y, .. } = raw
         && let Some((vertical, i)) = command_guide_at(app, app.active_tool(), [x, y], mods)
     {
-        app.guide_drag = Some(crate::rulers::GuideDrag { artboard: crate::rulers::guide_owner_at(app, x, y), vertical, index: Some(i), pos: if vertical { x } else { y } });
+        app.guide_drag =
+            Some(crate::rulers::GuideDrag { artboard: crate::rulers::guide_owner_at(app, x, y), vertical, index: Some(i), pos: if vertical { x } else { y } });
         crate::snap_ui::begin_guide(app, [x, y]);
         return;
     }
@@ -4494,7 +4495,12 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
     match ev {
         ToolEvent::Down { x, y, pressure } if tool == Tool::Move => {
             if let Some((vertical, i)) = crate::rulers::guide_at(app, x, y) {
-                app.guide_drag = Some(crate::rulers::GuideDrag { artboard: crate::rulers::guide_owner_at(app, x, y), vertical, index: Some(i), pos: if vertical { x } else { y } });
+                app.guide_drag = Some(crate::rulers::GuideDrag {
+                    artboard: crate::rulers::guide_owner_at(app, x, y),
+                    vertical,
+                    index: Some(i),
+                    pos: if vertical { x } else { y },
+                });
                 return;
             }
             // Auto-Select (or ⌘-click while it is off) picks the layer under the pointer first

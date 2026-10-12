@@ -117,14 +117,18 @@ pub fn document_bounds(doc: &photocraft_doc::Document) -> photocraft_geom::Rect 
 
 /// Clamp view against document-space bounds, including negative artboard positions.
 pub fn clamp_view_in_bounds(view: &mut View, size: egui::Vec2, ppp: f32, bounds: photocraft_geom::Rect) -> bool {
-    if bounds.is_empty() { return false; }
+    if bounds.is_empty() {
+        return false;
+    }
     let zoom = view.zoom / if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
     let c = [
         bounds.x0 as f32 + clamp_axis(view.center[0] - bounds.x0 as f32, bounds.width() as f32, size.x, zoom),
         bounds.y0 as f32 + clamp_axis(view.center[1] - bounds.y0 as f32, bounds.height() as f32, size.y, zoom),
     ];
     let moved = (c[0] - view.center[0]).abs() > 1e-3 || (c[1] - view.center[1]).abs() > 1e-3;
-    if moved { view.center = c; }
+    if moved {
+        view.center = c;
+    }
     moved
 }
 

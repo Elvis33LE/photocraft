@@ -421,7 +421,7 @@ pub fn cursor(app: &PhotocraftApp, p: [f64; 2]) -> Option<egui::CursorIcon> {
     let index = handles([f64::from(rect.x0), f64::from(rect.y0), f64::from(rect.x1), f64::from(rect.y1)])
         .iter()
         .position(|h| xf.to_screen(h[0] as f32, h[1] as f32).distance(point) <= 7.0)?;
-    let (hx, hy) = [( -1, -1), (0, -1), (1,-1), (1,0),(1,1),(0,1),(-1,1),(-1,0)][index];
+    let (hx, hy) = [(-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0)][index];
     Some(match (hx, hy) {
         (0, _) => egui::CursorIcon::ResizeVertical,
         (_, 0) => egui::CursorIcon::ResizeHorizontal,
