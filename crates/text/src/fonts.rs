@@ -5,7 +5,8 @@
 //! PostScript-name lookup for PSD import.
 
 use std::collections::HashMap;
-#[cfg(not(target_arch = "wasm32"))]
+// The two users (the directory scan, the fontconfig path parser) are compiled off on Apple.
+#[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -256,10 +257,11 @@ impl FontDb {
             // PingFang (the macOS Chinese UI font) lives outside the normal font folders.
             // CoreText's collection usually lists it, but the CJK fallback relies on the
             // family being present, so add the files when the collection missed them.
-            if !self.has_family("PingFang SC") && !self.has_family("PingFang TC") {
-                if let Some(f) = crate::cjk::mac_pingfang() {
-                    self.fcx.collection.load_fonts_from_paths([f]);
-                }
+            if !self.has_family("PingFang SC")
+                && !self.has_family("PingFang TC")
+                && let Some(f) = crate::cjk::mac_pingfang()
+            {
+                self.fcx.collection.load_fonts_from_paths([f]);
             }
             self.ps_cache.clear();
             self.face_cache.clear();
