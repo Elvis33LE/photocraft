@@ -453,6 +453,5 @@ pub fn merge_down(doc: &Document, lower: &Layer, upper: &Layer) -> Result<Layer,
     merged.clipped = lower.clipped && upper.clipped;
     merged.label = lower.label;
     merged.link_group = lower.link_group;
-    merged
     Ok(merged)
 }
