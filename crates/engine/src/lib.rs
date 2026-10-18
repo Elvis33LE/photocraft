@@ -14,7 +14,17 @@ pub mod cryptomatte_cmds;
 mod canvas_geom;
 mod channel_clip;
 mod clip_group;
+<<<<<<< C:/Users/User1/AppData/Local/Temp\z_theirs
+pub mod color_cmds;
+pub mod color_to_alpha_cmds;
+pub mod commands;
+pub mod comps_cmds;
 mod crop_fill;
+pub mod cryptomatte_cmds;
+pub mod cutout_cmds;
+=======
+mod crop_fill;
+>>>>>>> C:/Users/User1/AppData/Local/Temp\z_ours
 pub mod display_color;
 pub mod doc_path;
 pub mod filters;
