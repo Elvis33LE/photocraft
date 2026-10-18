@@ -28,6 +28,7 @@ pub mod channel_cmds;
 mod clip_group;
 pub mod color_cmds;
 pub mod color_to_alpha_cmds;
+pub mod cryptomatte_cmds;
 pub mod commands;
 pub mod comps_cmds;
 mod crop_fill;
