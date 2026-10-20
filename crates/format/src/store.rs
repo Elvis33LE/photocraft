@@ -830,9 +830,15 @@ impl PcraftWriter {
         self.hash_cache.retain(|_, (w, _)| w.strong_count() > 0);
         self.blob_hash_cache.retain(|_, (w, _)| w.strong_count() > 0);
         convert::check_nesting(&doc.layers)?;
-        doc.responsive.validate(doc.walk().len()).map_err(|message| FormatError::LimitExceeded(message.into()))?;
+        // Prune before validating: a deletion path that missed `remove_layers` leaves
+        // dangling entries in the in-memory layout, and their counts would fail the
+        // bounds below before `doc_m`'s save-side pruning could drop them. What gets
+        // validated is what gets saved.
+        let mut responsive = doc.responsive.clone();
+        let present = doc.walk().iter().map(|(_, _, l)| l.id).collect();
+        responsive.prune_absent(&present);
+        responsive.validate(doc.walk().len()).map_err(|message| FormatError::LimitExceeded(message.into()))?;
         let mut c = Collect { hash_cache: Some(&mut self.hash_cache), blob_hash_cache: Some(&mut self.blob_hash_cache), ..Default::default() };
-
         let document = convert::doc_m(doc, &mut c);
         let mut previews = Vec::new();
         if let Some(t) = &opts.thumbnail {
