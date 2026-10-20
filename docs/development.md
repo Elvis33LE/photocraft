@@ -239,7 +239,7 @@ cargo run -p photocraft-cli --example man-and-completions -- out/       # man pa
 
 `crates/format` defines the lossless native bundle. It is either a ZIP of STORE entries or a directory with the same layout:
 
-- `manifest.json`: the versioned document tree, with migrations in `format/src/migrate.rs`.
+- `manifest.json`: the versioned document tree, with migrations in `format/src/migrate.rs`. The current version is 2 (responsive layout data); version 1 files migrate on load by inserting the default empty responsive object. Files saved at version 2 do not open in builds that only know version 1, including documents with no responsive data — the version marks the schema, not the data.
 - `tiles/<blake3>.zst` and `blobs/<blake3>.zst`: zstd-compressed objects, content-addressed by the BLAKE3 hash of their uncompressed bytes.
 - `thumb.png` and `composite/preview.png`: previews.
 - `save.lock` (directory bundles only): an empty file a save holds an OS file lock on, so two writers or processes saving one bundle take turns (#4957).
