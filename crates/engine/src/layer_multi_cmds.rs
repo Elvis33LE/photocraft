@@ -732,8 +732,6 @@ fn doc_pixels_equal(a: &Document, b: &Document) -> bool {
         variables: _,
         timeline: _,
         file_encoding: _,
-        // Layout rules and variant groupings steer editor interactions; the compositor
-        // never reads them, so they cannot change pixels.
         responsive: _,
     } = a;
     *size == b.size
