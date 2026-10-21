@@ -847,8 +847,12 @@ impl PcraftWriter {
         if let Some(t) = &opts.composite {
             previews.push((COMPOSITE, png(t)?));
         }
+        // Compatibility: a document with no responsive data saves as version 1 (a v1-only
+        // reader keeps opening it byte-compatibly); version 2 marks files that carry the
+        // responsive layout program.
+        let format_version = if document.responsive.is_empty() { FORMAT_VERSION - 1 } else { FORMAT_VERSION };
         let manifest = Manifest {
-            format_version: FORMAT_VERSION,
+            format_version,
             generator: format!("photocraft-format {}", env!("CARGO_PKG_VERSION")),
             document,
             thumbnail: opts.thumbnail.as_ref().map(|_| THUMB.to_owned()),
