@@ -1014,4 +1014,5 @@ fn decreasing_deep_counts_are_refused_at_load() {
     }
     let bytes = save_to_bytes(&hostile, &SaveOptions::default()).unwrap();
     let err = load_from_bytes(&bytes).expect_err("decreasing counts must be refused");
-    assert!(err.to_string().contains("must not decrease"), "{err}");}
+    assert!(err.to_string().contains("must not decrease"), "{err}");
+}
