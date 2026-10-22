@@ -983,6 +983,7 @@ fn locked_stale_preview_does_not_fail_committed_save() {
     writer.save_dir(&doc, &dir, &SaveOptions::default()).unwrap();
     assert!(!dir.join("thumb.png").exists());
     std::fs::remove_dir_all(dir).unwrap();
+}
 
 /// A file whose deep counts decrease (a hostile or truncated edit) must be refused on load,
 /// not turned into a `total * 4` slice mismatch or an underflowing index later. The counts
