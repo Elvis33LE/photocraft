@@ -1309,6 +1309,8 @@ fn clouds_and_fibers_move_with_the_smart_object() {
             }
         }
     }
+}
+
 #[test]
 fn shifting_a_layer_refuses_a_deep_origin_overflow() {
     let mut l = Layer::new(
