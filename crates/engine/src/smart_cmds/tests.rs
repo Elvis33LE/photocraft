@@ -164,7 +164,7 @@ fn opaque_blur_at_scale(w: usize, h: usize) {
             opacity: 1.0,
             visible: true,
         });
-        let after = apply_smart_filters(&placed, &sm, s.active().unwrap().doc.bounds());
+        let after = apply_smart_filters(&placed, &sm, s.active().unwrap().doc.bounds()).expect("filters apply");
         for (x, y) in corners {
             assert!(after.sample_channel(x, y, 3) >= 0.999, "{w}x{h} source {depth}-bit blurred alpha at ({x},{y}) = {}", after.sample_channel(x, y, 3));
         }
