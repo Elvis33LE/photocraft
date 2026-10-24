@@ -1861,7 +1861,6 @@ fn deep_merge_refuses_dropped_compositing() {
     assert!(err.contains("opacity") && err.contains("Flatten"), "{err}");
 }
 
-
 /// #4535: every edit snapshots the document into history. The large payloads it carries (the
 /// XMP packet, Duotone's PSD data, an unsupported adjustment's bytes) are shared between the
 /// snapshot and the document, not copied per state.

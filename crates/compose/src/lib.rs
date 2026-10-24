@@ -19,8 +19,8 @@
 pub mod adjust;
 pub mod advanced;
 pub mod bounds;
-pub mod deep;
 pub mod cmyk;
+pub mod deep;
 pub mod effects;
 pub mod fill_layout;
 pub mod filter_mask;
