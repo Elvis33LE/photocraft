@@ -22,7 +22,11 @@ macro_rules! tl {
         $crate::i18n::t($s)
     };
 }
+<<<<<<< C:/Users/User1/AppData/Local/Temp\z_theirs
+pub mod artboard_overview;
+=======
 mod brush_mode_menu;
+>>>>>>> C:/Users/User1/AppData/Local/Temp\z_ours
 pub mod canvas;
 pub mod control;
 pub mod dialogs;
@@ -322,6 +326,8 @@ pub use widgets::tone;
 type InfoSampleKey = (i32, i32, u64, u32);
 
 pub struct PhotocraftApp {
+    /// Cached, revision-scoped previews for the Artboard Overview window.
+    pub(crate) artboard_overview: artboard_overview::Overview,
     pub session: Session,
     pub ui: UiState,
     pub services: Services,
