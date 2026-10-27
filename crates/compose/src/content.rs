@@ -84,6 +84,7 @@ pub(crate) fn render_content(layer: &Layer, rect: Rect, cx: &Ctx) -> Option<Buff
             _ => render_fill(f, rect, fill_frame(layer, cx.canvas), cx.patterns, adjustment_quantum(cx.depth)),
         },
         LayerContent::Adjustment(_) => return None,
+        LayerContent::Deep(d) => return Some(deep::render(d, rect)),
         _ => match layer.surface() {
             Some(s) => surface_to_scratch(s, rect),
             None => Buffer::transparent(rect),
