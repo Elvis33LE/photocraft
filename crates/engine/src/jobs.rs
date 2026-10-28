@@ -517,6 +517,17 @@ pub fn import_options(prefs: &crate::prefs::Preferences) -> photocraft_io::Impor
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn read_path(path: &str) -> Result<Vec<u8>> {
+    // Bounded reads, and a clear error for a file larger than memory (#375).
+    photocraft_format::read_file(std::path::Path::new(path)).map_err(|e| EngineError::Other(format!("{path}: {e}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_path(path: &str) -> Result<Vec<u8>> {
+    Err(EngineError::Other(format!("cannot open paths on the web: {path}")))
+}
+
 impl Session {
     /// Run the heavy part of inline (not background) job commands under `ctx`, so another thread
     /// can cancel them: a live preview whose parameters changed stops its stale computation
