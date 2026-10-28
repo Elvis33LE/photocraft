@@ -40,24 +40,29 @@ pub(super) fn read_meta(bytes: &[u8], limits: &Limits) -> Result<MetaData, Codec
     // Flat decoding may hold a source part and its display-window output at once. Admit
     // both allocations before pixel decoding, and cap the declared display canvas too.
     let mut total: u64 = 0;
+    // DWAA/DWAB parts are counted apart: they go past 2^16:1 (a flat 8192x4320 frame with 12
+    // alpha-scheme mattes is about 30 KB, over 75000:1).
+    let mut dwa: u64 = 0;
     for header in meta.headers.iter() {
         let size = header.layer_size;
         let (w, h) = (u32::try_from(size.0).unwrap_or(u32::MAX), u32::try_from(size.1).unwrap_or(u32::MAX));
         let bpp = header.channels.list.len().max(1) as u64 * 4;
         limits.check_bytes(w, h, bpp)?;
-        let display = header.shared_attributes.display_window;
-        let (dw, dh) = (u32::try_from(display.size.0).unwrap_or(u32::MAX), u32::try_from(display.size.1).unwrap_or(u32::MAX));
-        // The output is at most RGBA F32, regardless of the source's channel count.
-        limits.check_bytes(dw, dh, 16)?;
-        let source_bytes = u64::from(w).saturating_mul(u64::from(h)).saturating_mul(bpp);
-        // Image::from_f32/from_f16 owns a copy while the staging Vec is still alive.
-        // Only one part is decoded per request, so cap the worst part's peak, not the
-        // sum of the output stages of every part in a multi-part file.
-        let peak_bytes = source_bytes.saturating_add(u64::from(dw).saturating_mul(u64::from(dh)).saturating_mul(32));
-        total = total.max(peak_bytes);
+        let bytes = u64::from(w).saturating_mul(u64::from(h)).saturating_mul(bpp);
+        total = total.saturating_add(bytes);
+        if matches!(header.compression, Compression::DWAA(_) | Compression::DWAB(_)) {
+            dwa = dwa.saturating_add(bytes);
+        }
     }
     if total > limits.max_alloc {
         return Err(CodecError::LimitExceeded(format!("{total} bytes across {} parts exceed max_alloc {}", meta.headers.len(), limits.max_alloc)));
+    }
+    // The `exr` crate allocates a flat part's samples before reading its chunks, so the file
+    // must be able to hold them (#8597). The other compressions stay far below 2^16:1 even
+    // against this f32 budget. DWA's run-length channels are zlib-packed on top and reach about
+    // 132000:1, so DWA parts get 2^18:1. Deep parts size their samples from the file's own counts.
+    if !meta.requirements.has_deep_data {
+        Limits::check_plausible(total.saturating_sub(dwa).saturating_add(dwa / 4), bytes.len(), 1 << 16)?;
     }
     Ok(meta)
 }
